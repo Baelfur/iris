@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "core"
 version = "1.0.0"
 description = "Shared core for the REST-over-database layer — database-agnostic logic"
+license = "Apache-2.0"
 requires-python = ">=3.12"
 # Floor pins on each dep — the lower bound is the earliest version that
 # carries the API surface we use, so a pip install can't pick up a
