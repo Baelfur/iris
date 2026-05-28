@@ -8,6 +8,12 @@ All notable changes to IRIS are documented here. The format is based on [Keep a 
 
 - **Apache-2.0 LICENSE.** Repository is now licensed under Apache-2.0 — explicit patent grant, permissive use/modification/redistribution, attribution required. `core/pyproject.toml` carries the SPDX license expression. Downstream consumers (forks, internal redistributions) can build on the codebase under the standard Apache 2.0 terms.
 
+- **OCI image labels (`source`, `url`, `revision`, `licenses`) baked into release builds.** Every published image now carries `org.opencontainers.image.source` pointing at the current repo, plus `url`, `revision` (git SHA), and `licenses=Apache-2.0`. GHCR's package "Repository source" field reads from this label, so the package pages now correctly link back to `Baelfur/iris` instead of inheriting the sticky source from the pre-fork publish history.
+
+### Changed
+
+- **Image name moved from `ghcr.io/baelfur/app-{variant}` → `ghcr.io/baelfur/iris-public-{variant}`.** v1.0.0 briefly published to `app-{variant}` during the public-launch transition; from v1.0.1 forward, the canonical pull URL is `ghcr.io/baelfur/iris-public-{variant}:X.Y.Z`. The `app-` prefix was a brand-scrub artifact from pre-public dev (v8.0.0–v8.2.0 on iris-archive). The `iris-public-` prefix clearly identifies these as the publicly-released line and avoids inherited package state from the archive. Operators who pulled v1.0.0 from `app-{variant}` should update their image references; the `app-{variant}:1.0.0` tag remains pullable but won't receive further updates.
+
 ## [1.0.0] - 2026-05-28
 
 ### Added
