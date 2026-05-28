@@ -4,6 +4,8 @@ All notable changes to IRIS are documented here. The format is based on [Keep a 
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-05-28
+
 ### Added
 
 - **Apache-2.0 LICENSE.** Repository is now licensed under Apache-2.0 — explicit patent grant, permissive use/modification/redistribution, attribution required. `core/pyproject.toml` carries the SPDX license expression. Downstream consumers (forks, internal redistributions) can build on the codebase under the standard Apache 2.0 terms.
