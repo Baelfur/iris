@@ -1,0 +1,22 @@
+# Doc-templating config. Drives Jinja2 substitution in
+# docs/build.py. Edit the brand fields and re-run `python docs/build.py`
+# to regenerate every *.md from its *.md.tmpl source.
+#
+# Forks set these to whatever the surrounding product calls this layer.
+# Default is the current project brand ("iris" / "IRIS").
+
+# Identifier form (lowercase, no spaces). Used in code-style examples
+# (env var values, header slug derivations, etc.).
+app_name: iris
+
+# Display form (operator's preferred capitalization). Used in prose
+# titles and section headers. e.g. "IRIS" as a recognizable acronym vs
+# "Resource-Direct" with kebab title-case.
+display_name: IRIS
+
+# HTTP-header slug form — title-case each hyphen-separated segment.
+# Drops into header-name examples like X-{header_slug}-Deployment.
+# For `app_name: iris` this is "Iris"; for `app_name: resource-direct`
+# this is "Resource-Direct". Mirrors the runtime app_header_slug
+# function in core.config.settings.
+header_slug: Iris

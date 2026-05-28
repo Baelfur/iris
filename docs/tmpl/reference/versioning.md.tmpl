@@ -1,0 +1,144 @@
+# Versioning
+
+{{ display_name }} follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html). Version numbers are `MAJOR.MINOR.PATCH`:
+
+- **MAJOR** — breaking change to the public API
+- **MINOR** — new functionality, backwards compatible
+- **PATCH** — bug fixes, backwards compatible
+
+v1.0.0 is the initial public release.
+
+## What counts as the public API
+
+A major bump is required when any of the following change in a breaking way:
+
+### Runtime contract
+- **Dynamic query URL grammar** — operators, identifier rules, literal syntax, and the set of reserved `$`-prefixed query parameters
+- **Response envelope** — the JSON shape returned by dynamic endpoints and custom queries (`name`, `elements`, `links`)
+- **HTTP status codes** — the code returned for a given condition (400 / 401 / 403 / 404 / 503 / 200)
+- **Error body shape** — the top-level keys of error responses (`error`, message / title nesting)
+- **`ERROR_DETAIL=safe` codes** — the stable failure-class strings: `db.bad_credentials`, `db.connection_refused`, `db.permission_denied`, `db.timeout`, `db.query_failed`. Renaming or removing one is breaking. Adding a new code is not (clients must treat unknown codes as `db.query_failed`-equivalent). The `verbose`-mode body — raw driver text — is **not** part of the contract.
+
+### Configuration contract
+- **Environment variables** — names and meanings of documented env vars (`CONFIG__SOURCE`, `AUTH__MODE`, `ALLOWLIST__MODE`, `OPENAPI__VISIBILITY`, `READINESS_TIMEOUT_MS`, `ERROR_DETAIL`, `MAX_PAGE_SIZE`, each variant's connection vars, etc.)
+- **Default values** — a change that alters behavior for a config left unset
+
+### Operator contract
+- **Custom-query YAML format** — the schema of YAML files under `queries/` and `validation/`
+- **Docker image contract** — exposed ports, entrypoint, required env vars
+
+### Non-breaking additions allowed without a major bump
+- New `$`-prefixed query parameters (existing ones unchanged)
+- New env vars with defaults that preserve existing behavior
+- New response envelope fields (consumers must ignore unknown fields)
+- New endpoints
+- New variant adapters
+
+---
+
+## What is NOT public API
+
+These are internal. They may change in any version bump without notice:
+
+- `core` module layout, class names, function signatures
+- `DatabaseError` and other exception classes (internal contract between variants and core)
+- DDL cache internal representation
+- Log format details beyond the documented fields (`timestamp`, `level`, `logger`, `message`, `database`)
+- Per-variant `db.py` function signatures
+- Test fixtures and helpers
+- Anything under `core/core/` not documented as public
+
+If you import from `core` in your own code, you're on the internal side — expect breakage between minor versions.
+
+---
+
+## Version source of truth
+
+- **Authoritative:** git tags on `main` (`v1.0.0`, `v1.1.0`, etc.)
+- `core/pyproject.toml` — kept in sync with the highest tag
+- Docker image tags — match the git tag
+
+## Docker image tag convention
+
+Images are published to GHCR at `ghcr.io/baelfur/{{ app_name }}-{variant}:{tag}`.
+
+The tag is `<version-or-rolling><base-suffix>` where the base suffix is empty for the default `python:3.12-slim` runtime, `-distroless` for `gcr.io/distroless/python3-debian12`, and `-dhi` for the Docker Hardened Image (`dhi/python:3.12`). The DHI tags only publish when the repo has Docker Hub auth configured (operator-side decision; see `release.yml`).
+
+| Tag | Mutability | Use for |
+|---|---|---|
+| `:X.Y.Z` | immutable | production — pin to a specific version (default slim runtime) |
+| `:latest` | moves on stable release | local experimentation; pre-releases (`-rc.1`, `-beta.2`) do **not** update `:latest` |
+| `:main` | moves on every merge to main | CI against the unreleased tip. Single-arch (linux/amd64) only. |
+| `:X.Y.Z-distroless` | immutable | production with `gcr.io/distroless/python3-debian12` runtime — minimal CVE surface, no shell at runtime, free anonymous pulls |
+| `:distroless` | moves on stable release | rolling distroless tag, mirrors `:latest` |
+| `:main-distroless` | moves on every merge to main | CI consumers who want bleeding-edge distroless |
+| `:X.Y.Z-dhi` | immutable | production with Docker Hardened Image runtime — vendor-curated hardening (requires Docker Hub subscription with DHI entitlement to pull) |
+| `:dhi` | moves on stable release | rolling DHI tag, mirrors `:latest` |
+| `:main-dhi` | moves on every merge to main | CI consumers who want bleeding-edge DHI |
+
+Stable release images are multi-arch (`linux/amd64` + `linux/arm64`) for all bases. `:main*` rolling tags are single-arch (linux/amd64) to keep the per-merge build loop fast.
+
+**Picking a tag**: most operators want `:X.Y.Z` (default slim, anyone can pull). Pick `:X.Y.Z-distroless` when org-policy requires a hardened runtime and you want a free option. Pick `:X.Y.Z-dhi` when you have a Docker Hub DHI entitlement and prefer vendor-curated hardening over Google's distroless.
+
+---
+
+## Branching strategy
+
+Two long-lived branches:
+
+- **`main`** is the release branch. Release-please watches only `main`, so a tag and Release happen exactly when something lands here. `main` should always be deployable.
+- **`dev`** is the integration branch. Feature and fix PRs target `dev`. CI runs cheap checks (unit + integration) on every PR there.
+
+Periodically — when `dev` has accumulated a release window's worth of work — open a `dev → main` promotion PR. Merging it triggers release-please.
+
+### Why squash-merge is disabled
+
+Release-please reads Conventional Commits subjects on `main` to compute the next version bump. Squash-merge collapses N commits into one whose subject becomes the PR title — so a `dev → main` PR titled `chore: promote dev to main` would hide every `feat:` and `fix:` underneath, and release-please would bump nothing.
+
+The repo allows only **merge-commit** and **rebase-and-merge**. Both preserve individual commit subjects on `main`, so release-please sees them all and computes the highest applicable bump (`feat!` > `feat:` > `fix:` > nothing). Click whichever button GitHub offers; both are correct.
+
+### Bump arithmetic across a batch
+
+Release-please computes one bump per release window, not one per commit. Across the commits in a `dev → main` promotion:
+
+- Any `feat!:` or `BREAKING CHANGE:` footer → major (`X.0.0`)
+- Any `feat:` (no breaking) → minor (`x.Y.0`)
+- Only `fix:` / `perf:` → patch (`x.y.Z`)
+- All `chore:` / `docs:` / `refactor:` / `test:` / `ci:` / `style:` → no bump, no release PR
+
+Three fixes plus two features in one promotion produces one minor bump, not five releases.
+
+---
+
+## Release process
+
+Two automation layers:
+
+1. **`.github/workflows/release-please.yml`** maintains a "chore: release vX.Y.Z" PR that accumulates pending changes. Each commit to `main` updates the open release PR (or opens a new one) with the next version computed from Conventional Commits-style commit subjects (`feat:` → minor bump, `fix:` → patch, `BREAKING CHANGE:` in body → major). The release PR contains the version bump in `core/pyproject.toml` + `.release-please-manifest.json`. **Release-please does not touch `CHANGELOG.md`** — see "CHANGELOG handling" below.
+2. **`.github/workflows/release.yml`** triggers when a `vX.Y.Z` tag is pushed. Matrix-builds all 5 variants for `linux/amd64` + `linux/arm64`, publishes `ghcr.io/baelfur/{{ app_name }}-{variant}:X.Y.Z` (and updates `:latest` for stable versions), then creates a GitHub Release whose body is the matching `CHANGELOG.md` section.
+
+### Maintainer flow
+
+1. Open a feature/fix PR against `dev` with a Conventional Commits-style title (`feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`). For breaking changes include `BREAKING CHANGE:` in the commit body.
+2. Add an entry under `## [Unreleased]` in `CHANGELOG.md` describing the change in the project's hand-curated voice.
+3. Merge the PR. CI runs unit + integration on `dev`.
+4. Repeat for additional features/fixes; they all accumulate on `dev`.
+5. When ready to release, open a `dev → main` PR. **`validate-build.yml` runs the full 5-variant matrix as a required check** — the merge button stays disabled until every variant builds cleanly. Once green, merge it (any non-squash button — squash is disabled).
+6. Release-please opens or updates the standing release PR with the computed version bump. **`build-smoke.yml` runs as a required check on the release PR** — single-variant smoke gate to catch any regression between dev → main merge and tag creation.
+7. Merge the release PR. Release-please pushes the tag, which triggers the GHCR build + GitHub Release. `release.yml` reads the `[Unreleased]` block from `CHANGELOG.md` as the Release body, then a bot follow-up commit closes `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD` and starts a fresh empty `[Unreleased]` for the next cycle.
+
+The build gates at steps 5 and 6 mean the tag is the last thing that happens. If either gate fails, the PR doesn't merge, the version doesn't increment, no tag is created — fix-forward isn't necessary because nothing was committed.
+
+Breaking changes require a prominent note in the release CHANGELOG section with migration guidance.
+
+### CHANGELOG handling
+
+The CHANGELOG is hand-curated for narrative quality (themed sub-sections, contextual justifications, cross-references between related entries). Release-please's auto-generated CHANGELOG would be plainer (`### Features` / `### Bug Fixes` from raw commit subjects). To keep editorial control while still benefiting from release-please's tag automation, `release-please-config.json` sets `skip-changelog: true` per package — release-please bumps the version and creates the tag but never modifies `CHANGELOG.md`.
+
+### Pre-releases
+
+Pre-release tags (`vX.Y.Z-rc.1`, `vX.Y.Z-beta.2`) follow the same flow but are flagged as pre-release on GitHub and do **not** update the `:latest` Docker tag — operators pin pre-releases explicitly.
+
+## Reverting
+
+Each release is a git tag on `main`. To roll back a running deployment, pin your Docker image to the previous version tag (e.g. `ghcr.io/baelfur/app-postgres:X.Y.Z-1` instead of `:X.Y.Z`) and redeploy. {{ display_name }} is a stateless read layer — no migrations to unwind.

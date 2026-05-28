@@ -1,0 +1,306 @@
+name: Build and Publish Images
+
+# Three triggers, one workflow:
+#   - Tag push (v*) → multi-arch build, publish :{version} (and :latest for
+#     stable releases), create a GitHub Release whose body is the matching
+#     CHANGELOG section.
+#   - Push to main → single-arch build, publish :main for CI consumers.
+#   - workflow_dispatch — manual trigger for backfills.
+#
+# Three base images per variant:
+#   - python:3.12-slim                       → :{version}, :latest, :main
+#   - gcr.io/distroless/python3-debian12     → :{version}-distroless, :distroless, :main-distroless
+#   - dhi/python:3.12                        → :{version}-dhi, :dhi, :main-dhi
+#
+# DHI requires authenticated Docker Hub pulls. The build-dhi job is gated
+# on `vars.DH_AUTH_AVAILABLE == 'true'` (repo variable the operator sets
+# after configuring DOCKERHUB_USERNAME + DOCKERHUB_TOKEN secrets). When
+# unset, no DHI publish — slim and distroless still publish normally.
+#
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write   # for creating GitHub Releases on tag push
+  packages: write   # for pushing images to GHCR
+
+# cancel-in-progress: false — tag pushes and main pushes are
+# semantically distinct (a tag push from release-please shouldn't kill
+# a still-running main publish, and vice versa). Concurrency dedup
+# still kicks in for repeated tag pushes of the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-slim:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [postgres, oracle, mysql, mariadb, trino]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image tags + platforms
+        id: meta
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner_lc}/app-${{ matrix.variant }}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            tags="${image}:${version}"
+            if [[ ! "$version" =~ - ]]; then
+              tags="${tags},${image}:latest"
+            fi
+            platforms="linux/amd64,linux/arm64"
+          else
+            tags="${image}:main"
+            platforms="linux/amd64"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (slim)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/${{ matrix.variant }}/Dockerfile
+          build-args: BASE_IMAGE=python:3.12-slim
+          platforms: ${{ steps.meta.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-slim
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-slim
+
+  build-distroless:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [postgres, oracle, mysql, mariadb, trino]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image tags + platforms (distroless suffix)
+        id: meta
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner_lc}/app-${{ matrix.variant }}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            tags="${image}:${version}-distroless"
+            if [[ ! "$version" =~ - ]]; then
+              tags="${tags},${image}:distroless"
+            fi
+            platforms="linux/amd64,linux/arm64"
+          else
+            tags="${image}:main-distroless"
+            platforms="linux/amd64"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (distroless)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/${{ matrix.variant }}/Dockerfile
+          build-args: BASE_IMAGE=gcr.io/distroless/python3-debian12
+          platforms: ${{ steps.meta.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-distroless
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-distroless
+
+  build-dhi:
+    runs-on: ubuntu-latest
+    # Only run when the operator has configured Docker Hub auth + flagged
+    # this repo as having DHI access. See workflow header for details.
+    if: vars.DH_AUTH_AVAILABLE == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [postgres, oracle, mysql, mariadb, trino]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Log in to Docker Hub (for DHI pull)
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Compute image tags + platforms (dhi suffix)
+        id: meta
+        run: |
+          owner_lc=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner_lc}/app-${{ matrix.variant }}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            tags="${image}:${version}-dhi"
+            if [[ ! "$version" =~ - ]]; then
+              tags="${tags},${image}:dhi"
+            fi
+            platforms="linux/amd64,linux/arm64"
+          else
+            tags="${image}:main-dhi"
+            platforms="linux/amd64"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+      - name: Build and push (dhi)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/${{ matrix.variant }}/Dockerfile
+          build-args: BASE_IMAGE=dhi/python:3.12
+          platforms: ${{ steps.meta.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-dhi
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-dhi
+
+  release:
+    # Only on tag push; depends on build-slim (the canonical "the release"
+    # is the slim default). Failures in distroless / dhi builds don't
+    # block the GitHub Release publication — operators choosing alt bases
+    # have opted in and can recover via workflow_dispatch re-run.
+    needs: build-slim
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      # Check out main (not the tag) so the rename commit at the end of
+      # this job can push to it. Needs the PAT so the push has permission
+      # and triggers downstream workflows (the bot's chore: commit hits
+      # the same anti-loop policy as release-please's tag push). At the
+      # moment of a normal tag push, main and the tag point to the same
+      # commit, so reading CHANGELOG here gives us the [Unreleased] block
+      # the operator just shipped.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Compute version + today
+        id: version
+        run: |
+          version="${GITHUB_REF#refs/tags/v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "today=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract this version's CHANGELOG section
+        id: notes
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # Prefer the [Unreleased] block — that's the auto-flow case
+          # where this job will rename it to [X.Y.Z] later in this run.
+          # Falls back to a pre-existing [X.Y.Z] section if the operator
+          # renamed manually (legacy flow) or this is a re-run / backfill.
+          # Final fallback is a placeholder so the release doesn't fail
+          # outright when CHANGELOG is in an unexpected state.
+          awk '
+            /^## \[/ {
+              if (in_section) exit
+              if (index($0, "[Unreleased]")) { in_section = 1; next }
+            }
+            in_section { print }
+          ' CHANGELOG.md > /tmp/release-notes.md
+
+          if ! grep -q '[^[:space:]]' /tmp/release-notes.md; then
+            awk -v ver="$version" '
+              /^## \[/ {
+                if (in_section) exit
+                if (index($0, "[" ver "]")) { in_section = 1; next }
+              }
+              in_section { print }
+            ' CHANGELOG.md > /tmp/release-notes.md
+          fi
+
+          if ! grep -q '[^[:space:]]' /tmp/release-notes.md; then
+            echo "Release v${version} — see CHANGELOG.md for details." > /tmp/release-notes.md
+          fi
+
+      - name: Create or update GitHub Release with curated CHANGELOG body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          prerelease_flag=""
+          if [[ "$version" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          if gh release view "v${version}" >/dev/null 2>&1; then
+            echo "Release v${version} exists; updating body"
+            gh release edit "v${version}" --notes-file /tmp/release-notes.md
+          else
+            echo "Release v${version} does not exist; creating"
+            gh release create "v${version}" \
+              --title "v${version}" \
+              --notes-file /tmp/release-notes.md \
+              $prerelease_flag
+          fi
+
+      # Close the [Unreleased] section in CHANGELOG so the next release
+      # window starts clean. Runs AFTER the Release is published so a
+      # failed push here doesn't leave us with a placeholder body — the
+      # Release is durable; the CHANGELOG can be reconciled by hand if
+      # the rename push fails.
+      - name: Close [Unreleased] -> [X.Y.Z] in CHANGELOG and push to main
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          today="${{ steps.version.outputs.today }}"
+
+          if grep -q "^## \[${version}\]" CHANGELOG.md; then
+            echo "CHANGELOG already has [${version}] section; no rename needed"
+            exit 0
+          fi
+
+          if ! grep -q "^## \[Unreleased\]" CHANGELOG.md; then
+            echo "::warning::CHANGELOG.md has neither [${version}] nor [Unreleased]; skipping auto-rename"
+            exit 0
+          fi
+
+          awk -v ver="$version" -v today="$today" '
+            /^## \[Unreleased\]$/ {
+              print "## [Unreleased]"
+              print ""
+              print "## [" ver "] - " today
+              next
+            }
+            { print }
+          ' CHANGELOG.md > CHANGELOG.md.new
+          mv CHANGELOG.md.new CHANGELOG.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore: close [Unreleased] -> [${version}] in CHANGELOG"
+          git push origin main || (git pull --rebase origin main && git push origin main)

@@ -1,0 +1,8 @@
+sql: |
+  SELECT category, COUNT(*) as product_count
+  FROM public.products
+  GROUP BY category
+  ORDER BY product_count DESC
+params:
+  required: []
+  optional: []

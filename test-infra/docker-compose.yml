@@ -1,0 +1,117 @@
+version: "3.8"
+
+# Spins up all 4 databases seeded with test data.
+# Usage: docker compose up -d
+# Then point each variant at localhost with the ports below.
+
+services:
+  oracle:
+    image: gvenzl/oracle-free:slim
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: testpass
+      APP_USER: public_user
+      APP_USER_PASSWORD: testpass
+    volumes:
+      - ./init-oracle.sql:/container-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  mysql:
+    image: mysql:8
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: testpass
+      MYSQL_DATABASE: public
+    volumes:
+      - ./init-mysql.sql:/docker-entrypoint-initdb.d/init.sql
+
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: app
+    volumes:
+      - ./init-postgres.sql:/docker-entrypoint-initdb.d/init.sql
+
+  mariadb:
+    image: mariadb:11
+    ports:
+      - "3307:3306"
+    environment:
+      MARIADB_ROOT_PASSWORD: testpass
+      MARIADB_DATABASE: public
+    volumes:
+      - ./init-mysql.sql:/docker-entrypoint-initdb.d/init.sql
+
+  trino:
+    # Default Trino coordinator — the in-memory `memory` catalog is enabled
+    # out of the box. The Trino variant's test suite seeds
+    # memory.public.products via conftest.py on first run.
+    image: trinodb/trino:latest
+    ports:
+      - "8080:8080"
+
+  redpanda:
+    # Kafka broker for #23 / #115 integration tests. Redpanda is the
+    # typical dev-broker choice — single binary, no ZooKeeper, drop-in
+    # protocol-compatible with Kafka clients (confluent-kafka included).
+    # Dev mode + auto-create-topics keep the test setup minimal: tests
+    # publish to per-test unique topic names without pre-creating them.
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=512M
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+    ports:
+      - "9092:9092"
+
+  config-pg:
+    # Dedicated config Postgres for CONFIG_SOURCE=db e2e coverage. (#106)
+    # Separate from the postgres-variant's data DB so deployment-database
+    # creation (CREATE DATABASE per deployment) doesn't collide with the
+    # seeded data setup. Port 5433 on the host; default port 5432 inside
+    # the container — variants set CONFIG_DB_DSN against the mapped host
+    # port (or `config-pg:5432` if the variant container is on the
+    # compose network).
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: postgres   # admin DB; per-deployment DBs created on demand by the service
+
+# Connection cheat sheet:
+#
+# Oracle:    localhost:1521/FREEPDB1  user=public_user  pass=testpass
+# MySQL:     localhost:3306/public    user=root          pass=testpass
+# Postgres:  localhost:5432/app        user=postgres      pass=testpass  schema=public
+# MariaDB:   localhost:3307/public    user=root          pass=testpass
+# Trino:     localhost:8080           user=app           catalog=memory  schema=public
+# Config-PG: localhost:5433/postgres  user=postgres      pass=testpass  (CONFIG_SOURCE=db target)
+# Redpanda:  localhost:9092           (KAFKA_BROKERS / TEST_KAFKA_BROKERS target)
+#
+# Metadata-only accounts (DDL harvest, no data access):
+#   Oracle:   metadata_user / metapass
+#   Postgres: metadata_user / metapass
+#   MySQL:    metadata_user / metapass
+#   MariaDB:  metadata_user / metapass
+#
+# Passthrough accounts (SELECT on data tables):
+#   Oracle:   public_user / testpass
+#   Postgres: passthrough_user / passpass
+#   MySQL:    passthrough_user / passpass
+#   MariaDB:  passthrough_user / passpass

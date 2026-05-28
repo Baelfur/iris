@@ -1,0 +1,30 @@
+name: dependabot-auto-merge
+
+# Auto-merges Dependabot PRs once required checks pass. Gated by the
+# repo variable DEPENDABOT_AUTO_MERGE — set to "true" in
+# Settings → Secrets and variables → Actions → Variables to enable.
+# Default: off. The workflow runs on every Dependabot PR but skips the
+# merge step unless the variable is "true".
+#
+# Prerequisite: branch protection on the target branch requiring CI
+# green before merge. Without that, --auto fires the moment GitHub
+# considers the PR mergeable.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]' && vars.DEPENDABOT_AUTO_MERGE == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

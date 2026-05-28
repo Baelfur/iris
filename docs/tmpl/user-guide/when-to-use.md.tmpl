@@ -1,0 +1,123 @@
+# When to use {{ display_name }}
+
+A decision guide for architects and engineering managers. No vendor grid; just the shape of the fit and the shape of the misfit, with reasoning.
+
+## The shape {{ display_name }} is for
+
+You have a database (or several — possibly of different engines). You have consumers who want to read from it. You want:
+
+- A uniform HTTP surface that speaks JSON.
+- Consumers who don't need DB drivers, DB credentials, or SQL skills beyond "filter rows on a column."
+- A consistent audit point (one place logs every query) rather than direct DB connections scattered across clients.
+- Read-only by construction on the dynamic `/{schema}/{table}` surface — not by policy that someone could forget to apply. Operator-authored custom queries under `/queries/*` are safe-by-review rather than safe-by-construction; see [security-posture.md](security-posture.md) for the distinction.
+- A tight enough API surface that you don't have to review every consumer's query to feel comfortable.
+
+If most of that resonates, {{ display_name }} is likely a reasonable fit.
+
+## Strong fits
+
+**Internal data-platform teams.** You run a warehouse or a reporting replica, and you have many internal consumers — dashboards, notebooks, analysts' scripts, other services' background jobs. You don't want each of them installing a database driver, managing their own credentials, or writing their own HTTP wrappers. One {{ display_name }} per DB, a gateway in front, and every consumer talks HTTP.
+
+**Cross-engine estates.** You're operating Oracle in one business unit, Postgres in another, a Trino lakehouse for analytics, and consumers have to move between them. {{ display_name }} gives you an identical API shape across all five supported engines. A client written against the Postgres {{ display_name }} works against the Oracle {{ display_name }} with only a URL change. The value is the *consistency*, not any one engine.
+
+**Lakehouse-to-HTTP gateway.** You run Trino for federated analytics. Consumers want query access but shouldn't install a Trino client or hold Trino credentials. {{ display_name }} in front of Trino gives them `GET /catalog.schema.table?...` URLs with the same safety properties as any other variant.
+
+**"Everyone needs a read model" situations.** Microservices each have their own DB, and each team keeps getting the same ask: "can you give us an HTTP endpoint for that table?" Put {{ display_name }} in front of each service's read replica, publish the URL pattern, and delete the pile of one-off GET endpoints teams have been maintaining.
+
+## Weak fits
+
+**You need writes.** {{ display_name }} is read-only by construction. If your consumers need to create or update rows, you need a different tool. You *can* run {{ display_name }} for reads and a separate service for writes, but at that point question whether a uniform API over your DB is actually what you want, or whether you want an application.
+
+**You need the full expressive power of SQL to be available at the URL.** {{ display_name }}'s closed grammar is small on purpose. If your analysts are expected to write `LIKE '%foo%'`, `CASE WHEN`, window functions, or dynamic joins from the URL, {{ display_name }} will frustrate them. Custom queries (YAML) cover the cases where operators can pre-define the shape, but if consumers need to author arbitrary SQL, give them SQL — a notebook, a BI tool, a query console.
+
+**You need a GraphQL-ish federated query layer.** {{ display_name }} does not stitch. One table per request. One custom-query file per pre-built joined view. If you want `{ orders { customer { ... } lineItems { ... } } }` automatically federated across services, use GraphQL.
+
+**You need sub-10ms p99 for hot paths.** {{ display_name }} does one DB round-trip per request. There's no caching layer, no materialization, no precomputed responses. If your use case is "serve this lookup 50k times a second at p99=5ms," put a cache in front of {{ display_name }}, or don't use {{ display_name }} for that path.
+
+**You need streaming.** Responses are buffered JSON. Pagination works, but a 10M-row scan will happily buffer 10M rows in memory at `$count=10000000`. Set `MAX_PAGE_SIZE` and design clients to paginate.
+
+**You need Postgres-specific things over the wire.** {{ display_name }} returns JSON rows, not Postgres binary protocol. No `COPY`, no listen/notify, no native array types as anything other than their JSON-serialized forms. If you need those, connect to Postgres directly.
+
+## Posture-level comparison to alternatives
+
+This is not a feature grid. It's how {{ display_name }} positions against the options architects typically weigh it against, at the level that matters for the adoption decision.
+
+### vs. letting clients connect directly to the DB
+
+Direct connections give consumers maximum flexibility — they can write any SQL. That's the thing {{ display_name }} is trading away. In exchange:
+
+- One place logs every query.
+- No database driver installed at the consumer.
+- Credentials don't need to be handed out (or are scoped per-consumer via passthrough, with {{ display_name }}'s validation bounding what they can ask for even if their credentials would allow more).
+- Read-only by construction — not by granting `SELECT`-only and hoping.
+- A uniform API across multiple DB engines.
+
+You'd pick direct connections when consumers are a small number of trusted callers who actually need SQL flexibility. You'd pick {{ display_name }} when consumers are numerous, diverse, or semi-trusted, and the flexibility tax is worth the operational consistency.
+
+### vs. hand-written REST endpoints (Flask / Express / etc.)
+
+Every time someone asks "can you expose an endpoint for table X" and you build a new Flask route, you're writing variations on the same theme: validate params, build SQL, serialize, paginate, handle errors. {{ display_name }} is that work, done once.
+
+The real difference is not effort — it's consistency and boundary. A hand-written endpoint has whatever safety properties its author remembered. {{ display_name }} has the same safety properties for every endpoint automatically: identifiers validated, literals bound, writes impossible. Consumers get the same URL shape for every table instead of every team inventing their own.
+
+You'd pick hand-written endpoints when the endpoint needs to do real work — business logic, transformations, writes, composition. You'd pick {{ display_name }} when the endpoint is genuinely "give me rows from this table, with some filters."
+
+### vs. Hasura, PostgREST, Supabase's REST API
+
+These are also "HTTP in front of a database." They go further than {{ display_name }}: richer query grammars, write support, GraphQL, auth plumbing, subscriptions.
+
+{{ display_name }} is deliberately narrower:
+
+- Read-only. No writes at all. No chance of a misconfigured policy allowing a write.
+- Closed filter grammar. No `LIKE` or function calls at the URL layer. The consumer can only ask for shapes the grammar can express.
+- Cross-engine. PostgREST is Postgres. Hasura is Postgres/MySQL/SQL Server/BigQuery with different feature levels per engine. {{ display_name }}'s five variants (Postgres, MySQL, MariaDB, Oracle, Trino) have the same feature set everywhere.
+- Small. A few thousand lines of Python. The feature set fits in your head.
+
+You'd pick Hasura or PostgREST when their richer feature set (writes, subscriptions, deep relational queries) is what you want and their posture fits your risk tolerance. You'd pick {{ display_name }} when your requirements are actually read-only and you want the smaller surface — both for review and for the bounded-API guarantee it gives you.
+
+### vs. building a BI tool's API
+
+Tools like Cube or dbt Semantic Layer expose metrics/dimensions over HTTP. That's a different shape of problem: they're giving you semantic modelling, caching, and aggregation pipelines.
+
+{{ display_name }} is just "rows from this table" — no modelling layer, no cache, no metrics DSL. If your consumers want curated metrics (`total_revenue_by_region_by_month`), a semantic layer is the right tool. If they want to read rows, {{ display_name }} is lighter and cheaper.
+
+### vs. a message bus / CDC stream
+
+For "keep my system in sync with changes in their DB," use CDC (Debezium, native logical replication, etc.). {{ display_name }} gives you point-in-time reads; it doesn't give you change events.
+
+## Decision shortcuts
+
+Answer these four questions. If any is "yes" to the first column, lean {{ display_name }}. If any is "yes" to the second column, {{ display_name }} is probably the wrong choice.
+
+| Lean {{ display_name }} | Lean away |
+|---|---|
+| Read-only access | You need writes |
+| Many internal consumers, small DB team | Small number of sophisticated consumers who need SQL |
+| Heterogeneous DB estate | Single DB that matches a richer tool's sweet spot (Postgres → PostgREST) |
+| Safety-first posture; bounded API | Need `LIKE`, window functions, aggregations across tables at the URL |
+| Happy with "one request, one table" | Need composed / federated queries over a graph |
+
+## The honest caveats
+
+{{ display_name }}'s closed grammar is an opinion. Consumers who've used richer "OData" or Hasura-style APIs will initially find it restrictive. The response to that is custom queries: operators pre-build the shapes consumers need, and consumers parameterize them. This works well when there's a small-to-medium set of reusable analytical shapes. It works badly when every consumer wants a fundamentally different query.
+
+The lack of caching is also an opinion. A request always hits the DB. If you want caching you're building another layer. That's sometimes fine and sometimes annoying.
+
+The DDL cache being in-memory and harvested at startup is convenient but means schema changes require a ping or a restart. Most teams don't change schemas often enough for this to matter, but a team doing rapid schema evolution will want to automate the re-harvest.
+
+## Where {{ display_name }} fits best
+
+Best uses, in our view:
+
+- Behind an API gateway that terminates TLS, enforces auth, and rate-limits — {{ display_name }} handling the "translate URL to safe SQL" job and nothing else.
+- As a replacement for a pile of hand-rolled GET endpoints that all do the same thing slightly differently.
+- As the read API for internal-facing data products where the consumers are many, the DB count is plural, and the safety/consistency property is worth more than flexibility.
+
+Worst uses, in our view:
+
+- As a public API. It's fine *behind* a public gateway, but the stock manifests don't ship TLS, rate limiting, or a full auth stack. The presumption is that something else does those.
+- As the write path for anything.
+- As the backend for a feature-rich BI tool. The grammar is too narrow.
+- When you'd have to build a dozen custom queries to cover consumer needs. At that point you're writing a query service; write a query service.
+
+If you're somewhere on the boundary — "we want this but maybe we need a bit more" — lean toward trying {{ display_name }} for the read paths you have and keeping a separate purpose-built service for the things {{ display_name }} doesn't do. Don't bend {{ display_name }} to cover cases it isn't shaped for. The narrowness is the value.

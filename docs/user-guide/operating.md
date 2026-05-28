@@ -1,0 +1,746 @@
+# Operating IRIS
+
+You're deploying and running IRIS. This is what you need to know to do that well.
+
+## What IRIS actually is, operationally
+
+A stateless FastAPI app, served by uvicorn, packaged as a Docker image. One image per supported database family — `app-postgres`, `app-mysql`, `app-mariadb`, `app-oracle`, `app-trino`. Python 3.12. Listens on port 8000 inside the container.
+
+It holds exactly two kinds of state:
+
+1. **A connection pool** to the configured database (min 2, max 10 by default).
+2. **An in-memory DDL cache** — the schema/table/column map it uses to validate every request.
+
+Both are built at startup, and both are disposable: restart the pod, they rebuild. There's no local storage, no sidecar, no shared cache layer.
+
+## Deploying a variant
+
+Every variant has the same deployable surface:
+
+```
+<variant>/
+  Dockerfile
+  requirements.txt
+  .env.example
+  app/
+  k8s/
+    deployment.yaml
+    service.yaml
+    secret.yaml
+    hpa.yaml
+```
+
+Build and push:
+
+```bash
+docker build -t <registry>/app-postgres:1.0.0 -f variants/postgres/Dockerfile .
+```
+
+Note the `-f` and the build context — Dockerfile is per-variant but the context is the repo root, because it also needs to copy the shared `core/` package.
+
+Apply the k8s manifests, having filled in the secret:
+
+```bash
+kubectl apply -f variants/postgres/k8s/
+```
+
+The deployment runs 2 replicas by default, with an HPA that scales up to 10 on 70% CPU. The container takes 100m CPU and 128Mi RAM as request, 500m / 256Mi as limit — these are reasonable starting points for modest QPS, but see the tuning section below.
+
+### Naming convention
+
+Pick a stable `DEPLOYMENT_NAME` per IRIS instance and let it cascade. Two `app-postgres` deployments fronting different DBs should have different names — `inventory`, `billing`, `audit`, etc. The name is optional, but every layer that consumes it gets noticeably cleaner identity when set.
+
+Recommended pattern:
+
+| Surface | Convention |
+|---|---|
+| Pod / k8s service | `iris-<variant>-<deployment-name>` (e.g. `app-postgres-inventory`) |
+| `DEPLOYMENT_NAME` env var | `<deployment-name>` (e.g. `inventory`) |
+| Structured-log field | `"deployment": "<deployment-name>"` (auto-emitted) |
+| OTel `service.name` | `iris-<deployment-name>` (default when `OTEL_SERVICE_NAME` is unset) |
+| Future config-DB name | `<deployment-name>` (matches a per-deployment Postgres database) |
+
+Validation: the env var must match `^[a-z][a-z0-9_-]{0,62}$` (lowercase, alphanumeric + underscore + hyphen, ≤63 chars, starts with a letter). A bad value fails fast at lifespan startup with a clear error. Hyphens are accepted because Kubernetes / Helm / Docker names use them pervasively; when `CONFIG__SOURCE=db`, `DbSource` normalizes hyphens to underscores for the per-deployment Postgres database name (unquoted identifier rules), logging the substitution at INFO.
+
+Pod and service names aren't constrained by the regex (k8s allows hyphens), but making them visually consistent — `app-postgres-inventory` for the pod, `inventory` for the env var — is the easy operational story.
+
+## Configuration
+
+### Required
+
+| Variable | Purpose |
+|---|---|
+| `CONFIG__SOURCE` | Where `validation/` and `queries/` YAMLs come from. One of `local` / `git` / `db`. Required — operators must opt into the source rather than fall back to whatever the image baked. See [external-configuration.md](external-configuration.md) for which to pick. |
+| Variant-specific connection vars | See per-variant section below |
+
+### Optional but commonly set
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAPI_RENDER_MODE` | `simple-schema` | Spec verbosity per harvested table. Three values: `simple-schema` (default; one generic simple-filter param + column list in description — keeps the spec lean at scale), `optimized-schema` (concrete params for indexed/PK/FK columns; non-indexed columns surface via the generic entry), `full-schema` (every column gets its own concrete simple-filter param — previously behavior, useful for small deployments where exhaustive enumeration is desirable). Runtime accepts any allowed column regardless of mode. |
+
+#### Narrowing the dynamic surface — `allowlist.yaml`
+
+The harvest runs against every non-system schema the service account has `SELECT` on; the DB's role grants are the canonical scope. To narrow further (multi-deployment-shared service account, dev-environment defense-in-depth, etc.) drop an `allowlist.yaml` at the config root:
+
+```yaml
+# allowlist.yaml — both sections optional, both support glob patterns
+schemas:
+  - public
+  - audit
+
+tables:
+  - public.fact_*
+  - public.dim_customer
+```
+
+Semantics: empty file or missing file = no narrowing. Non-empty `schemas:` allows only the listed schemas. Non-empty `tables:` allows only the listed (qualified) tables. Combine with AND. `/admin/reload-config` re-reads the file.
+
+The `ALLOWED_SCHEMAS` env var was removed in favor of this; operators with the env var set should move the schema list into `allowlist.yaml`'s `schemas:` section. (See CHANGELOG migration note.)
+
+#### Cost of unrestricted harvest
+
+Harvest time and DDL-cache memory scale with how much the service account can see:
+
+- **Oracle:** `ALL_TAB_COLUMNS` includes every schema the role has `SELECT` on. Enterprise installs (EBS, Fusion, APEX) can produce tens of thousands of rows. Use `allowlist.yaml` to scope to the application slice if startup is slow.
+- **Trino:** the harvest scans every schema in the configured `TRINO_CATALOG`. Lake catalogs (Hive over hundreds of databases) can be slow and memory-heavy. Pin via the allowlist.
+- **Postgres / MySQL / MariaDB:** typically modest. Usually not a problem.
+
+#### Cost of leaving the OpenAPI spec unrestricted
+
+Big deployments (1000+ tables) produce big specs. Combine `allowlist.yaml` with `OPENAPI_RENDER_MODE=simple-schema` (default) or `optimized-schema` to keep the spec browseable in Swagger UI / ReDoc. `full-schema` mode at high table counts is genuinely too verbose to render comfortably.
+
+If startup feels slow or pod memory grows past expectations, that's the signal to set the env. The shape of the harvest query itself doesn't change; only the row count does.
+
+### Operationally important
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `READINESS_TIMEOUT_MS` | `500` | How long `/ready` waits on the DB ping. Set to `0` to disable the DB hit (readiness then reports ready whenever the process is alive — equivalent to `/health`). |
+| `MAX_PAGE_SIZE` | `10000` | Ceiling on `$count`. Set to `0` (explicit opt-out) for unbounded — operators with that genuine need declare it rather than inheriting it from omission. Tune up or down based on your row sizes / pool worker memory budget. |
+| `CURSOR_SECRET` | unset (per-process random) | HMAC key for cursor pagination tokens (`$cursor`). When unset, each replica generates its own 32-byte random key at startup — cursors don't survive process restarts or load-balance across replicas. **Set explicitly (32+ random chars) when running >1 pod replica** or when cursors need to survive restarts; rotating the secret invalidates all in-flight cursors. See [Using IRIS — `$cursor`](../user-guide/using.md#cursor--keyset-pagination-large-walks). |
+| `ERROR_DETAIL` | `terse` | `terse` (default) collapses response bodies to generic strings (`"Bad request"`, `"Not found"`, `"Query failed"`). `safe` returns a stable `{"error": {"code": "db.<class>", "message": "..."}}` shape on driver errors so clients can branch on `db.bad_credentials` / `db.connection_refused` / `db.permission_denied` / `db.timeout` / `db.query_failed` without seeing topology. `verbose` returns raw driver text plus `deployment` and `database` operator-debug fields — dev / inside-trust-perimeter only. Logs always retain full driver text. **Scope:** all three modes shape only **wrapped DB-driver errors**. Validation errors (invalid column, unknown schema, missing required parameter, expression-grammar errors) continue to echo full detail in every mode — they're feedback about the caller's input, not server-state leaks, and collapsing them to opaque strings would make every 4xx undebuggable from the client side. **Open list:** the `db.*` codes above are today's set, not a closed contract. New variants and new failure shapes may add codes (e.g. `db.deadlock`, `db.disk_full`); clients should treat unknown `db.*` codes as `db.query_failed`-equivalent for fallback. Renaming or removing a code is breaking; adding one is not. |
+| `LOG_USER_SECRET` | unset | HMAC secret for de-PII'ing usernames in logs while preserving correlation. See the logging section. |
+| `LOG_LEVEL` | `INFO` | Root-logger level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive — `LOG_LEVEL=debug` is accepted). Module loggers inherit. The `uvicorn.access` logger is independently pinned to `WARNING` regardless — it duplicates IRIS's own per-request log line and is silenced deliberately. Set `WARNING`/`ERROR` in production when a deployment is chatty; set `DEBUG` to diagnose a specific request (revert after — DEBUG logs include parser internals and request bodies). |
+| `DEPLOYMENT_NAME` | unset | Canonical identity for this IRIS deployment. When set, threads through log records (`"deployment"` field) and OTel `service.name` (defaults to `iris-<name>`). Validated against Postgres identifier rules (`^[a-z][a-z0-9_-]{0,62}$`) so the same name can later become a per-deployment config-DB name without renaming. See "Naming convention" below. |
+| `TLS_CERT_FILE`, `TLS_KEY_FILE` | unset | When **both** are set, the entrypoint launches uvicorn with `--ssl-certfile` / `--ssl-keyfile`, so the pod terminates TLS itself on port 8000. Read at container launch (not from `.env`). See "Getting TLS in front of IRIS" below. |
+| `POOL__MIN_SIZE`, `POOL__MAX_SIZE` | `2`, `10` | DB connection pool bounds per pod. Tune against your DB's `max_connections` and your peak replica count — see the "Pool sizing" section below. Trino ignores these (no real pool). |
+| `POOL__HPA_MAX_REPLICAS` | `10` | Peak replica count IRIS uses when computing the startup pool-sizing report. Match to your HPA `maxReplicas` (or the static replica count if you don't run HPA). Advice-only; never auto-applied. |
+| `POOL__QUERY_TIMEOUT_SECONDS` | `30` | Per-query DB timeout. Each variant wires its native mechanism (Postgres `statement_timeout`, MySQL `MAX_EXECUTION_TIME`, MariaDB `max_statement_time`, Oracle `call_timeout`, Trino `query_max_execution_time`). `0` disables. Set this below your gateway's request timeout so IRIS surfaces a clean DB error rather than letting the gateway drop the connection mid-query. |
+| `CIRCUIT_BREAKER__ENABLED` | `false` | When `true`, wraps DB calls in a per-process async circuit breaker. After `CIRCUIT_BREAKER__FAIL_MAX` consecutive failures, subsequent requests short-circuit with `503 Retry-After: <seconds>` for `CIRCUIT_BREAKER__RESET_TIMEOUT` seconds before allowing a probe. Useful on flakier infrastructure; unnecessary on stable DBs. |
+| `CIRCUIT_BREAKER__FAIL_MAX` | `5` | Consecutive driver failures that trip the breaker. |
+| `CIRCUIT_BREAKER__RESET_TIMEOUT` | `5.0` | Seconds the breaker stays open before the next request becomes a probe. |
+| `CONFIG__GIT_URL`, `CONFIG__GIT_BRANCH`, `CONFIG__GIT_TOKEN` | unset, `main`, unset | When `CONFIG__SOURCE=git`: repo URL, branch to clone, optional PAT for HTTPS auth. Requires the `core[config-git]` extra. |
+| `CONFIG__DB_DSN` | unset | When `CONFIG__SOURCE=db`: admin-database conninfo for the config Postgres server. `DEPLOYMENT_NAME` is required in this mode (it's the per-deployment database name). Requires the `core[config-db]` extra and a `CREATEDB` grant on the IRIS service account. |
+| `ENABLE_METRICS` | `false` | When `true`, mounts `/metrics` with Prometheus-format request count, in-flight gauge, latency histogram, and error rate. Requires the optional `core[metrics]` extra (`prometheus-fastapi-instrumentator`). Default off — no surprise route, no surprise dep. Endpoint is unauthenticated when enabled; restrict via network policy / mesh. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | **Setting this activates IRIS tracing** (presence-detected). When set, attaches the OpenTelemetry FastAPI instrumentor: accepts upstream `traceparent` headers, emits per-request spans, and exports via OTLP gRPC to the configured collector. Requires the optional `core[tracing]` extra. Service name and resource attributes flow through standard OTel env vars (`OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`; see "Tracing" below). Default off. |
+| `ENABLE_DB_TRACING` | `false` | Second gate on top of `OTEL_EXPORTER_OTLP_ENDPOINT`. When both are set, each variant registers its driver-level OpenTelemetry instrumentor so DB calls emit child spans under the HTTP request span. Opt-in because DB spans include the executed SQL by default — see "DB-level spans" under Tracing for the trade-offs. Trino: no-op with INFO log (no official `aiotrino` instrumentor). |
+| `KAFKA__BROKERS` | unset | When set, the root logger gains a queue-buffered Kafka handler emitting the same JSON envelope going to stdout. Comma-separated `host:port` list. Requires the optional `core[kafka]` extra (`confluent-kafka`). Default off — no extra thread, no extra dep. Multi-producer-safe: N IRIS instances can target one topic; consumers demux on the `host` and `deployment` envelope fields. See "Kafka logging" below. |
+| `KAFKA__TOPIC` | `iris.events` | Topic to publish to. |
+| `KAFKA__CLIENT_ID` | `iris-<deployment>-<host>` | Producer `client.id`. Empty default → auto-derived to be per-pod-unique so broker-side observability doesn't conflate replicas of one deployment. |
+| `KAFKA__ACKS` | `1` | Producer ack semantics. `0` = fire-and-forget (lowest latency, highest drop risk). `1` = wait for leader (default). `all` = wait for all replicas (highest durability, highest latency). |
+| `KAFKA__QUEUE_MAX` | `10000` | In-process queue size between IRIS log calls and the Kafka producer thread. Records past this drop with a metric bump rather than blocking. |
+
+### Authentication
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTH__MODE` | **required** | User-facing posture. `jwt` validates inbound JWT against `AUTH__JWKS_URL`. `gateway` accepts any caller and assumes upstream gateway validated. `open` accepts any caller, no upstream assumption (dev only — startup logs a WARNING). No default; operators must declare. |
+| `AUTH__JWKS_URL` | unset | JWKS endpoint URL. **Required when `AUTH__MODE=jwt`** (settings validation rejects `mode=jwt` without `jwks_url`). Ignored otherwise. |
+| `AUTH__AUDIENCE` | unset | Optional. Validates `aud` claim when `AUTH__MODE=jwt`. |
+| `AUTH__ISSUER` | unset | Optional. Validates `iss` claim when `AUTH__MODE=jwt`. |
+| `AUTH__REQUIRE_PASSTHROUGH` | `true` | When true, data routes (`/{schema}/{table}` and `/queries/<path>`) reject requests without `X-DB-Authorization` (or `Authorization: Basic`) at the IRIS layer — 401 before the DB call. Fail-closed against deployments running with a service account that has full data SELECT. Set `false` to permit pool-mode access for callers that don't supply passthrough creds. |
+| `AUTH__ADMIN_TOKEN` | unset | Shared secret required on `X-Admin-Token` for `/admin/*` endpoints. **Unset means admin endpoints fail closed (401).** Set to a long random string and pin it in your secret store. |
+
+`AUTH__MODE` is required (no default) so operators opt into a posture deliberately. The three modes:
+
+- **`jwt`** — IRIS validates JWTs at every user-facing call. Pair with `AUTH__JWKS_URL` and (recommended) `AUTH__AUDIENCE` / `AUTH__ISSUER`.
+- **`gateway`** — IRIS accepts any caller; the documented assumption is that an upstream gateway / service mesh / proxy already validated identity and forwards trustworthy traffic. Use with [the SSO-in-front-of-IRIS pattern](#putting-sso-in-front-of-iris) when SSO is the auth source.
+- **`open`** — IRIS accepts any caller, no upstream assumption. Dev / inside-trust-perimeter only. Logs a WARNING at startup.
+
+The admin lane is independent of `AUTH__MODE` — `AUTH__ADMIN_TOKEN` is what gates `/admin/*` regardless of which user-facing posture is in effect.
+
+### Putting SSO in front of IRIS
+
+`AUTH__JWKS_URL` covers the **programmatic** SSO case — anything with a JWT in hand calls IRIS, IRIS validates the signature/audience/expiry against the configured IDP. What it doesn't cover is the **interactive browser login** flow: a human hitting `/docs` who needs to log in to Okta / Entra / Auth0 / Google Workspace before they can call anything.
+
+The recommended pattern is a reverse proxy in front of IRIS that handles the OIDC dance. `oauth2-proxy` is the canonical choice; `pomerium`, cloud-vendor IAP (Google IAP, AWS ALB OIDC, Azure App Service auth), and ingress-controller plugins all play the same role. The proxy terminates the browser session, gets the user's bearer token, and forwards it to IRIS as `Authorization: Bearer <jwt>` — at which point IRIS's existing `AUTH__JWKS_URL` validation is the second-stage check.
+
+This keeps the auth code out of IRIS (smaller surface, fewer security-review findings) and matches how most ops teams already handle SSO across their service estate.
+
+#### oauth2-proxy sidecar example
+
+Drop oauth2-proxy alongside IRIS in the same pod, point it at the IDP, and have it forward to `localhost:8000` (IRIS):
+
+```yaml
+# oauth2-proxy ConfigMap — adjust IDP fields to your tenant
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oauth2-proxy-config
+data:
+  oauth2-proxy.cfg: |
+    provider = "oidc"
+    oidc_issuer_url = "https://idp.example.com/realms/iris"
+    client_id = "iris"
+    redirect_url = "https://iris.example.com/oauth2/callback"
+    upstreams = ["http://127.0.0.1:8000"]
+    email_domains = ["example.com"]
+    cookie_secret = "<32-byte base64 — see oauth2-proxy docs>"
+
+    # Forward the IDP's bearer to IRIS as `Authorization: Bearer <jwt>`,
+    # which is what IRIS's AUTH__JWKS_URL expects.
+    pass_authorization_header = true
+    pass_access_token = true
+
+    # Don't strip the bearer when calling upstream.
+    skip_jwt_bearer_tokens = true
+```
+
+```yaml
+# Deployment — IRIS + oauth2-proxy in one pod, traffic enters via the proxy
+spec:
+  template:
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:latest
+          args: ["--config=/config/oauth2-proxy.cfg"]
+          ports:
+            - containerPort: 4180
+          volumeMounts:
+            - name: config
+              mountPath: /config
+        - name: iris
+          image: ghcr.io/baelfur/app-postgres:latest
+          env:
+            - name: AUTH__MODE
+              value: "jwt"
+            - name: AUTH__JWKS_URL
+              value: "https://idp.example.com/realms/iris/protocol/openid-connect/certs"
+            - name: AUTH__AUDIENCE
+              value: "iris"
+          ports:
+            - containerPort: 8000
+      volumes:
+        - name: config
+          configMap:
+            name: oauth2-proxy-config
+```
+
+The `Service` then targets the proxy port (`4180`) instead of IRIS directly. Browser hits the proxy → OIDC redirect → callback → proxy forwards to IRIS with the bearer attached → IRIS validates against its JWKS.
+
+#### Ingress-controller alternative
+
+If your ingress controller already handles auth (`nginx-ingress` with `auth-url`/`auth-signin`, Traefik with `forwardAuth`, Istio's `RequestAuthentication`), wire IRIS in there. The pattern is identical: ingress does the OIDC dance, forwards `Authorization: Bearer <jwt>`, IRIS validates.
+
+#### Verifying the chain
+
+Two checks confirm the wiring works:
+
+1. **JWKS path reachable from IRIS**: `kubectl exec` into the IRIS container and `curl $AUTH__JWKS_URL` — should return JWKS JSON. If this fails, IRIS will 401 every authed request after a cache miss.
+2. **Bearer reaches IRIS**: log into the proxy in a browser, then call IRIS through it with `curl -v` — confirm the request that reaches IRIS has `Authorization: Bearer ey...` (decode at jwt.io to see the claims). If the bearer is missing, the proxy isn't forwarding (`pass_authorization_header` not set, or the proxy strips the header).
+
+#### Why not build OIDC into IRIS
+
+A built-in OIDC flow (IRIS itself acts as an OAuth client, exposes `/auth/login` and `/auth/callback`, manages browser sessions) is a real option but trades a deploy-time hop for runtime auth code: cookie management, CSRF, refresh tokens, client-secret distribution. The proxy pattern keeps IRIS's auth surface narrow. If a deployment context can't run a proxy, file an issue — the in-process flow is build-on-demand, not pre-built.
+
+### Gating the admin lane through a gateway
+
+`AUTH__ADMIN_TOKEN` is a single shared secret. The dominant deployment anti-pattern is "share one token across the team in chat / a wiki / an environment file" — the rotation story is bad, the audit story is worse (every admin action is "the operator," not Alice or Bob), and "leaked admin token" is one accidental Slack-paste away.
+
+The recommended pattern moves admin authentication to the gateway. The gateway handles authentication and authorization however your org already does it (SSO, mutual TLS, an internal API key system, JIT IAM, signed requests — whatever) on its public side; on its IRIS-facing side, it injects the static `X-Admin-Token` header on requests that passed the gateway's checks. IRIS sees a normal token-authed request and never has to know how the gateway decided to grant access.
+
+```
+Operator → Gateway (does authn/authz)
+              │
+              ├── reject (401/403) ── stops here
+              │
+              └── allow → adds X-Admin-Token: <static> → IRIS /admin/*
+```
+
+The static admin token never leaves the gateway. Operators rotate access by changing the gateway's policy (group membership, key revocation, mTLS cert expiration) rather than rotating the IRIS token itself.
+
+#### Gateway features that do this
+
+Most API gateways and ingress controllers support static-header injection on a per-route basis, applied after the gateway's own auth check:
+
+| Gateway | Feature |
+|---|---|
+| Kong | `request-transformer` plugin: `config.add.headers = "X-Admin-Token:<value>"` per route or service. Runs after auth plugins. |
+| API Umbrella | Per-API-backend `headers` array — static-header injection on the upstream call. |
+| Tyk | `transform_request_headers` middleware. |
+| Ambassador / Emissary | `add_request_headers` on a `Mapping`. |
+| AWS API Gateway | Request mapping templates (Mapping Templates → integration request). |
+| nginx (custom ingress) | `proxy_set_header X-Admin-Token "<value>";` on the location block. |
+| Cloudflare Workers / similar edge | Add the header in the worker after the auth check. |
+
+The principle is the same regardless of tool — the gateway authenticates the request its own way, then attaches the IRIS-side credential before forwarding.
+
+#### Audit identity
+
+The static token doesn't carry user identity, so IRIS's admin logs show *what* happened but not *who* did it. Two ways to recover identity:
+
+1. **Audit at the gateway, correlate by request ID.** The gateway logs `Alice triggered POST /admin/refresh-schema; request_id=abc123`. IRIS logs `POST /admin/refresh-schema; request_id=abc123`. Cross-reference by ID. This is what most operators do.
+2. **Forward identity headers.** Have the gateway also inject something like `X-Forwarded-User: alice@example.com` and configure your log pipeline to capture that field. IRIS doesn't process the header today, but log aggregators (Splunk, Datadog, etc.) can index it from the request log.
+
+Pick whichever fits your existing observability shape.
+
+#### When gateway auth isn't an option
+
+Smaller deployments without an API gateway (single pod, internal-only, dev environments) keep using `AUTH__ADMIN_TOKEN` directly. The shared-secret-handed-out pattern is the trade-off; mitigate with token rotation and minimum-necessary scope. The gateway pattern is the path forward when the deployment grows past one operator.
+
+### Hybrid SSO admin — JWT with admin group claim
+
+For deployments without a gateway that still want SSO-driven admin access (smaller orgs, single-pod test environments, dev setups), the admin gate also accepts a Bearer JWT carrying a configured group claim. Configured alongside the existing `X-Admin-Token` path — both work simultaneously, token wins when both headers are on the same request.
+
+```
+| Setting                        | Default     | What it does |
+|--------------------------------|-------------|--------------|
+| `AUTH__ADMIN_GROUP`            | unset       | Claim value that grants admin access (e.g. `iris-admin`). Empty disables the JWT-admin path entirely — today's token-only behavior, bit-for-bit. |
+| `AUTH__ADMIN_CLAIM_NAME`       | `groups`    | Which JWT claim to inspect. Common: `groups`, `roles`, `scope`. The `scope` shape is space-delimited per OAuth convention; others are list-of-strings or single-string. |
+| `AUTH__OIDC_AUTH_URL`          | unset       | IDP authorization endpoint. When all three OIDC URLs are set, Swagger UI's Authorize button runs the OIDC popup against the IDP. |
+| `AUTH__OIDC_TOKEN_URL`         | unset       | IDP token endpoint. |
+| `AUTH__OIDC_CLIENT_ID`         | unset       | IRIS's registered client ID at the IDP. |
+```
+
+The JWT-admin path validates against `AUTH__JWKS_URL` — same JWKS as the user-facing `AUTH__MODE=jwt` lane. Settings validation rejects `AUTH__ADMIN_GROUP` being set without `AUTH__JWKS_URL` at startup, since runtime validation would fail every JWT-admin request with a less clear error.
+
+#### What this buys vs the shared-token path
+
+- **Per-user audit.** JWT-admin actions log the resolved identity (`sub` claim) at INFO. "Who triggered the schema refresh that broke prod?" gets answered.
+- **No more shared secret.** SSO group membership grants admin. Remove alice from the `iris-admin` group at the IDP and her admin access disappears without rotating anything.
+- **Swagger Authorize button works.** When the three OIDC URLs are configured, hitting `/admin/docs` in a browser and clicking Authorize runs the OIDC popup — no need to manually paste a JWT into the Bearer field.
+
+#### Failure modes
+
+- No `X-Admin-Token` and no `Authorization` header → 401 ("Admin credentials required").
+- `X-Admin-Token` invalid → 401 ("invalid admin token").
+- Bearer JWT invalid / expired → 401 ("Invalid token" / "Token expired").
+- Bearer JWT valid but missing the admin claim → **403** ("Admin access denied"). Specifics (`sub`, expected claim, observed value) log at WARNING; public body stays generic.
+
+#### Claim-shape examples
+
+```
+# Keycloak / Auth0 default — list of groups
+{"sub": "alice@corp", "groups": ["engineering", "iris-admin"]}
+# AUTH__ADMIN_GROUP=iris-admin, AUTH__ADMIN_CLAIM_NAME=groups (default)
+
+# Simple role claim — single string
+{"sub": "alice@corp", "role": "iris-admin"}
+# AUTH__ADMIN_GROUP=iris-admin, AUTH__ADMIN_CLAIM_NAME=role
+
+# OAuth scope claim — space-delimited
+{"sub": "alice@corp", "scope": "read write iris-admin"}
+# AUTH__ADMIN_GROUP=iris-admin, AUTH__ADMIN_CLAIM_NAME=scope
+```
+
+### Restricting who can reach IRIS
+
+IRIS itself doesn't have an application-layer IP allowlist setting and shouldn't grow one — the request's source IP at the HTTP layer is the proxy's, not the original caller's, the moment any gateway / load balancer / mesh sits in front. App-layer allowlists fight with proxies; the right place to enforce "only the gateway can reach IRIS" is one layer below IRIS, in the network fabric.
+
+The pattern is the same across deployment shapes: **the layer below IRIS does the inbound restriction.** What that layer is varies:
+
+| Deployment | Primary layer | Mechanism |
+|---|---|---|
+| **Kubernetes** | `NetworkPolicy` | Label-based pod-to-pod firewall enforced by the CNI. Don't enumerate pod IPs (they're ephemeral) — select gateway pods by label. Combine with `Service` type `ClusterIP` so IRIS isn't reachable from outside the cluster. |
+| **Cloud VM** (AWS / GCP / Azure) | Security group / firewall rule | Reference the gateway's security group or instance tag, not its IP — auto-scaling and instance recreations stay transparent. |
+| **On-prem VM with Docker** | Host firewall (iptables / nftables / ufw / firewalld) | Allow only the gateway's source IP or interface. **Watch the Docker iptables interaction** — see gotcha below. |
+| **Single-host docker compose** (gateway + IRIS same host) | Don't expose IRIS's port externally | Drop the `ports:` declaration on the IRIS service; gateway reaches it via Docker's internal network DNS (`http://iris:8000`). External callers have no route to IRIS at all. |
+
+Example NetworkPolicy for Kubernetes (only Kong pods may reach IRIS):
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: iris-allow-only-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: app-postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: kong
+        # If kong runs in another namespace, add:
+        #   namespaceSelector:
+        #     matchLabels:
+        #       name: kong-prod
+```
+
+#### Docker iptables gotcha
+
+When IRIS runs as a Docker container with `-p 8000:8000`, Docker writes its own iptables rules in chains (`DOCKER-USER`, `DOCKER-INGRESS`) that execute **before** distro firewall rules (ufw, firewalld). A `ufw deny 8000` won't block the published port — Docker has already accepted it.
+
+Two fixes:
+
+1. **Use the `DOCKER-USER` chain** (the chain Docker explicitly leaves alone for operators):
+   ```bash
+   iptables -I DOCKER-USER -p tcp --dport 8000 -s 10.0.1.50 -j ACCEPT  # gateway
+   iptables -A DOCKER-USER -p tcp --dport 8000 -j DROP                  # everything else
+   ```
+2. **Bind to a specific interface** so the port isn't exposed externally to begin with:
+   ```bash
+   docker run -p 127.0.0.1:8000:8000 ...   # only localhost
+   docker run -p 10.0.1.5:8000:8000  ...   # only the internal NIC's address
+   ```
+
+The bind-to-specific-IP form is the cleanest answer when the gateway is on the same host or a known internal address — Docker's iptables manipulation only opens the port on the address you specify.
+
+### Closing the OpenAPI spec surface
+
+`OPENAPI__VISIBILITY` controls whether the user-facing spec endpoints (`/docs`, `/redoc`, `/openapi.json`) are publicly reachable, gated behind the admin token, or fully off. The data plane is closed against unauthenticated reads via `AUTH__REQUIRE_PASSTHROUGH=true` (default), so anyone hitting `/public/products` without credentials gets a 401 — but the spec endpoints have historically been unauthenticated, leaking the schema map (table names, column lists, custom-query routes) to anyone with the URL. That's reconnaissance-grade information disclosure, low risk on trusted networks and worth closing elsewhere.
+
+| Mode | `/docs` | `/redoc` | `/openapi.json` | Use when |
+|---|---|---|---|---|
+| `enabled` (default) | HTML | HTML | unauthenticated JSON | Trusted-network deployments. Gateway-fronted shape — gateway gates the URL externally. |
+| `admin-enabled` | 404 | 404 | requires `X-Admin-Token` | Programmatic spec consumers (SDK builds, doc generators, internal API catalogs) authenticate with the same secret that gates `/admin/*`. Browsers can't render the spec. |
+| `disabled` | 404 | 404 | 404 | Maximum closed. Use when consumers already have a generated SDK or the deployment runs on an untrusted network. |
+
+The admin sub-app's `/admin/docs` and `/admin/openapi.json` always require `X-Admin-Token` regardless of `OPENAPI__VISIBILITY` — they describe operator-facing actions and have no public-spec mode.
+
+### Per-variant connection vars
+
+**PostgreSQL** — `PG_HOST`, `PG_PORT` (5432), `PG_USER`, `PG_PASSWORD`, `PG_DATABASE`
+
+**Oracle** — `ORACLE_HOST`, `ORACLE_PORT` (1521), `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_SERVICE` (service name, not SID)
+
+**MySQL** — `MYSQL_HOST`, `MYSQL_PORT` (3306), `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE`
+
+**MariaDB** — `MARIADB_HOST`, `MARIADB_PORT` (3306), `MARIADB_USER`, `MARIADB_PASSWORD`, `MARIADB_DATABASE`
+
+**Trino** — `TRINO_HOST`, `TRINO_PORT` (8080), `TRINO_USER`, `TRINO_CATALOG` (catalog pinned for all queries), `TRINO_SCHEME` (default `http`; set to `https` for credential passthrough)
+
+## The critical startup invariant
+
+On startup the lifespan handler:
+
+1. Opens the DB connection pool.
+2. Runs a DDL harvest query against `information_schema` (or `all_tab_columns` for Oracle) to populate the in-memory schema cache. The harvest excludes per-database system schemas and includes everything else the service account has `SELECT` on; if an `allowlist.yaml` is present at the config root, the cache is narrowed to the listed schemas/tables after harvest (or, with `ALLOWLIST__MODE=presentation`, only the OpenAPI spec is narrowed and the full cache is preserved).
+3. Loads any `queries/*.yaml` custom queries.
+4. Loads any `validation/*.yaml` view definitions and warns on any that don't match a harvested table.
+
+**If the DB isn't reachable at startup, the pod won't become ready.** The readiness probe is wired to a real DB ping, so rollout will stall on a dead database rather than sending traffic to broken pods. This is usually what you want.
+
+**If you add a table or column to the DB, IRIS won't know about it until it re-harvests.** Re-harvest options:
+
+- Restart the pods (DDL is re-harvested at startup).
+- `POST /admin/refresh-schema` to re-harvest without a restart.
+
+The admin endpoint is gated by `X-Admin-Token` matching `AUTH__ADMIN_TOKEN`. Unset → 401 on every call. The probe paths (`/health`, `/ready`, `/readyz`) remain unauthenticated by design (k8s probes need them to be) but they hit the DB and shouldn't be reachable from outside the trusted perimeter.
+
+## Probes and endpoints
+
+- `GET /health` — liveness. Returns `{"status": "ok"}`, plus `"deployment": "<DEPLOYMENT_NAME>"` when `DEPLOYMENT_NAME` is set. Process-alive only. Wire this to `livenessProbe`.
+- `GET /ready` and `GET /readyz` — readiness. Pings the DB with a timeout (`READINESS_TIMEOUT_MS`). Returns `200 {"status": "ready"}` or `503 {"status": "not ready", "reason": "..."}`; both shapes include `"deployment"` when `DEPLOYMENT_NAME` is set. Wire to `readinessProbe`. Two paths exist for cross-convention compatibility.
+- `POST /admin/refresh-schema` — re-harvest DDL without restarting. Requires `X-Admin-Token: $ADMIN_TOKEN`.
+- `POST /admin/reload-config` — re-pull validation/queries YAML from `CONFIG__SOURCE` (git pull / disk re-read / config-DB refresh) and reload view defs and custom queries without restarting. Requires `X-Admin-Token`. Returns counts of view defs and custom queries loaded. See [External configuration](external-configuration.md) for the source-specific details.
+- `GET /admin/pool-sizing` — JSON form of the startup pool-sizing report. Requires `X-Admin-Token`.
+- `GET /admin/queries` — list custom queries. Requires `X-Admin-Token` (operator-facing recon surface; end users invoke individual queries by URL, they don't enumerate). Lives on the admin sub-app — separated from the dev surface so the catalog doesn't appear in `/openapi.json`.
+
+The stock manifests wire `livenessProbe: /health` and `readinessProbe: /ready`. That's correct — don't swap them. `/health` is cheap and should never trigger a restart unless the process itself is wedged; `/ready` does a DB hit and will flap exactly when you want pods to drain.
+
+## Observability
+
+### Logs
+
+IRIS emits structured JSON logs to stdout, one event per line. Every record carries:
+
+```json
+{"timestamp": "2026-04-22T12:34:56.789Z", "level": "INFO", "logger": "iris",
+ "message": "GET /reporting/orders 200 12.4ms", "module": "main",
+ "database": "postgresql", "host": "app-postgres-7d8b9-abcde",
+ "deployment": "inventory"}
+```
+
+- `database` is set per variant — in an aggregator you can split traffic by DB family at a glance.
+- `host` is `socket.gethostname()` — typically the pod name on Kubernetes; lets multi-pod log streams be demuxed without per-pod tagging at the producer.
+- `deployment` is present only when `DEPLOYMENT_NAME` is set; it's the canonical identity for an IRIS deployment and drives correlation across logs / OTel `service.name` / response headers.
+- `module` carries the Python module that emitted the record — useful when a problem narrows to a specific subsystem (e.g., `circuit_breaker`, `kafka_logging`).
+
+Every request is logged with method, path, status, and duration in milliseconds. DB errors come through with level `ERROR`.
+
+### PII in logs
+
+DB errors can leak usernames. If a user hits a passthrough endpoint and their credentials are wrong, the DB may reply with `password authentication failed for user "alice"` and IRIS will log that error. To avoid putting raw usernames in your log aggregator:
+
+- Set `LOG_USER_SECRET` to a stable secret. Usernames in error messages get replaced with `user:<16-hex-chars>` — a salted HMAC that's stable under a fixed secret but not reversible without it.
+- Leave it unset, and usernames become `<redacted>` instead (safe, but you lose the ability to correlate auth failures for the same user across pods).
+
+The hash is deterministic: `hash_username('alice')` returns the same string every time under the same secret. That lets you check a log entry against a candidate username by running the hash function locally, without ever putting cleartext names in the aggregator.
+
+### Metrics
+
+Set `ENABLE_METRICS=true` and install the optional `core[metrics]` extra. IRIS mounts `/metrics` with Prometheus-format counters for request count, in-flight requests, latency histograms (per method × path × status), and error rate via [`prometheus-fastapi-instrumentator`](https://github.com/trallnag/prometheus-fastapi-instrumentator).
+
+Default off — operators who don't run a Prometheus stack don't need the dep installed and don't get a surprise route. The endpoint is **unauthenticated** when enabled; restrict who can reach it via network policy or mesh, or scrape from inside the trust perimeter.
+
+If you don't enable the built-in exporter, the same signals are available from whatever runs in front of IRIS (ingress, mesh, sidecar). Either way, the signals that matter:
+
+- Per-endpoint latency — mostly reflects DB latency. Watch the tail.
+- 4xx rate — high and sudden usually means a new client doing something wrong (unknown column, bad filter); slow-rising can mean schema drift that hasn't been re-harvested.
+- 5xx rate — usually means the DB is unhappy. See also `/ready` flapping.
+- Readiness-probe pass rate — the single cleanest "is the DB okay from this pod's perspective" signal.
+
+### Tracing
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector URL and install the optional `core[tracing]` extra. IRIS attaches the OpenTelemetry FastAPI instrumentor, which:
+
+- Accepts upstream `traceparent` headers from the gateway, so a gateway → IRIS hop continues an existing trace.
+- Emits one span per HTTP request with method, route, status, and timing attributes.
+- Exports via OTLP gRPC to the configured collector.
+
+**Activation rule across IRIS sinks:** sinks with a required destination config presence-detect on it (`KAFKA__BROKERS` for log streaming, `OTEL_EXPORTER_OTLP_ENDPOINT` for tracing); sinks without one use `ENABLE_*` toggles (`ENABLE_METRICS`, because Prometheus is pull-style and has no destination URL). Setting the destination is the activation gesture — there is no separate `ENABLE_TRACING` toggle.
+
+Configuration uses the standard OTel env vars (read by the SDK directly):
+
+| Variable | Purpose |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector URL. **Setting this activates tracing.** No default. |
+| `OTEL_SERVICE_NAME` | `service.name` attribute on every span. IRIS defaults to `iris-<DEPLOYMENT_NAME>` when unset; the operator's explicit value wins. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra `k=v,k=v` pairs (deployment env, cluster, region). |
+
+Default off — no surprise SDK initialization, no surprise deps. The HTTP layer alone closes the loop with an upstream gateway.
+
+For OTLP HTTP rather than gRPC, swap the exporter dep (`opentelemetry-exporter-otlp-proto-http`) and override the import in your own setup.
+
+#### DB-level spans (opt-in)
+
+Setting `ENABLE_DB_TRACING=true` (in addition to `OTEL_EXPORTER_OTLP_ENDPOINT`) registers driver-level OpenTelemetry instrumentation per variant. DB calls then emit child spans nested under the HTTP request span — the trace UI shows the SQL execution as a sub-segment of the request, so operators can attribute slow requests to slow queries without leaving the trace view.
+
+| Variant | Instrumentor | Status |
+|---|---|---|
+| postgres | `opentelemetry-instrumentation-psycopg` | Supported |
+| oracle | `opentelemetry-instrumentation-oracledb` | Best-effort — async-mode instrumentor has had rough edges historically; a failure to instrument logs WARNING and continues |
+| mysql | none | No PyPI-published OTel instrumentor for `aiomysql` (only the sync MySQL drivers `mysql-connector-python` / `pymysql` are covered). Toggle logs the gap when enabled |
+| mariadb | none | Same as mysql (shared driver) |
+| trino | none | No official `aiotrino` instrumentor. Toggle logs the gap when enabled |
+
+For the gap cases (mysql / mariadb / trino) the HTTP request span still emits, and the URL + path encodes the query for trace-side derivation — so triage is still possible, just without the nested-span shape.
+
+**Default off because:** (1) the closed-grammar architecture makes the SQL derivable from the URL + path + catalog without driver-level spans — so DB spans buy *incremental* visibility (DB-vs-middleware time breakdown, pool-wait attribution) rather than baseline visibility; (2) DB spans include the executed SQL in the `db.statement` attribute by default, which is sensitive when passthrough usernames and WHERE values land in the observability backend.
+
+**When to flip on:** you're triaging a tail-latency mystery that the HTTP span alone can't explain, you want to see pool-checkout wait time directly in traces, or your observability backend handles attribute redaction at ingest and the SQL exposure isn't a concern.
+
+When `ENABLE_DB_TRACING=true` but `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, the helpers no-op — both conditions must hold to incur the instrumentor's runtime cost.
+
+### Kafka logging
+
+Set `KAFKA__BROKERS` to a comma-separated `host:port` list and install the optional `core[kafka]` extra. IRIS attaches a queue-buffered Kafka handler to the root logger; the same JSON envelope going to stdout also lands on the configured topic. Default off — operators not running Kafka don't get the dep, the thread, or the failure surface.
+
+**Multi-producer topology is first-class.** Run N IRIS pods (replicas of one deployment, or different deployments) all publishing to one topic. Demux on consumer side using the `host` and `deployment` envelope fields; `KAFKA__CLIENT_ID` defaults to `iris-<deployment>-<host>` so broker-side observability (consumer-lag, throttling, ACL audit) doesn't conflate them.
+
+**Drop-on-failure, never block.** When the broker is down, the producer's local queue fills, or the in-process queue overflows, IRIS drops the record and bumps a counter — never blocks a request handler, never raises from an `emit()` call. The tradeoff is that broker outages mean missing log records; disk-buffer + replay is explicitly out of scope.
+
+Counters surface as Prometheus gauges when `ENABLE_METRICS=true` is also set:
+
+- `iris_kafka_records_published_total`
+- `iris_kafka_records_dropped_queue_full` — IRIS's in-process queue overflowed
+- `iris_kafka_records_dropped_buffer_full` — confluent-kafka's local producer queue full (broker slow / unreachable)
+- `iris_kafka_records_dropped_producer_error` — producer raised on send (auth, serialization, etc.)
+
+Without metrics enabled, drop visibility comes from the aggregator side (your stdout pipeline still has every record).
+
+#### Auth
+
+Standard `confluent-kafka` config keys flow through env vars consumed by the client library directly — TLS, SASL/PLAIN, SASL/SCRAM, OAUTHBEARER all work the way the librdkafka docs describe them. IRIS doesn't proxy or special-case auth config; bring your own.
+
+#### Tradeoffs
+
+- `KAFKA_ACKS=0` → fire-and-forget. Lowest latency on the producer thread; highest drop risk if the broker is unreachable.
+- `KAFKA_ACKS=1` (default) → wait for leader ack. Sane balance.
+- `KAFKA_ACKS=all` → wait for all in-sync replicas. Highest durability, but the producer thread blocks longer per record. Only matters under sustained log volume.
+
+The in-process `KAFKA__QUEUE_MAX` (default 10000) is the buffer between IRIS's logger calls and the producer thread. Sustained log throughput exceeding what the producer can drain (slow broker, low ack semantics, network saturation) → records drop with `dropped_queue_full` rather than backpressure into request handlers.
+
+#### Trust boundary for log content
+
+Enabling Kafka extends the trust perimeter for log content to anyone with topic read access. The envelope carries DB driver text (host / port / role names), `socket.gethostname()` (pod name in k8s; potentially-meaningful hostname elsewhere), and any `extra={}` structured fields. See [security-posture.md Control 10 — Log-stream trust boundary](security-posture.md#10-log-stream-trust-boundary-when-kafka-is-enabled) for the threat-model framing and the per-field breakdown.
+
+## Capacity and tuning
+
+### Connection pool
+
+Each pod opens a pool with min `POOL__MIN_SIZE` (default 2), max `POOL__MAX_SIZE` (default 10) connections. With 2 replicas at the default settings, that's up to 20 pool connections. If you have 10 replicas at peak via the HPA, that's 100 — check your DB can support that alongside other clients.
+
+Tune via env vars; no rebuild required. The startup pool-sizing report below prints the math given your DB's observed limit.
+
+### Concurrency per pod
+
+FastAPI + uvicorn + async drivers give you many concurrent in-flight requests per pod. The real bottleneck is either the DB itself or the connection-pool max. A request that can't get a pool connection will wait; sustained pool starvation will show up as latency growth before it shows up as errors.
+
+### Query timeout
+
+`POOL__QUERY_TIMEOUT_SECONDS` (default 30) is enforced by the database itself per variant — Postgres `statement_timeout`, MySQL `MAX_EXECUTION_TIME`, MariaDB `max_statement_time`, Oracle `call_timeout`, Trino `query_max_execution_time`. A runaway query (missing index, expensive `IN` list, slow Trino source) is interrupted instead of holding a pool worker indefinitely. Set this **below** your gateway's request timeout so IRIS surfaces a clean DB error rather than letting the gateway drop the connection mid-query and leave IRIS still blocked. `0` disables.
+
+### Circuit breaker
+
+Off by default. Set `CIRCUIT_BREAKER__ENABLED=true` on flakier infrastructure (legacy DBs prone to transient outages, network partitions, restart-heavy maintenance windows). When `CIRCUIT_BREAKER__FAIL_MAX` consecutive DB calls fail, the breaker opens — subsequent requests return `503` with a `Retry-After` header for `CIRCUIT_BREAKER__RESET_TIMEOUT` seconds before allowing one probe through. Successful probe → closed. Failed probe → re-opens.
+
+What it buys you: during a real outage, every request stops sitting on its driver timeout. Pool workers free up, CPU stays low (relevant for HPA pinned to 70% — failing-request thrash can spuriously trigger scale-up), the gateway gets a clear back-off signal, logs aren't flooded with N driver-timeout exceptions per request.
+
+What it doesn't do: protect against partial outages (some queries work, some don't). The breaker counts *all* failures; one slow degraded path can keep tripping it while the healthy path stays available. If your failure modes are partial rather than total, leave it off.
+
+State is per-process — each uvicorn worker has its own breaker. With multiple replicas the union of breaker states is what the gateway sees. Trip events log at `WARNING` (`Circuit breaker tripped after N consecutive failures...`); recovery logs at `INFO`.
+
+### Page size
+
+`MAX_PAGE_SIZE` is the single biggest operational lever. A 10M-row table, with no cap, hit by `GET /schema/bigtable?$count=10000000` will happily return 10M rows and eat a lot of pod memory (the results are buffered in a list before serialization). Set a cap.
+
+### DDL cache size
+
+It scales with (schemas × tables × columns). Columns are stored in a Python `set` per table. For typical OLTP-shaped schemas (thousands of columns total) this is trivial — hundreds of KB. For very wide warehouses, just verify.
+
+### Trino is different
+
+The Trino variant doesn't have a pool abstraction. It holds one long-lived `Connection` per process, with aiohttp keep-alive underneath, and opens a cursor per query. This is deliberate — closing and reopening the connection would kill the HTTP keep-alive benefit — but it means you lose the buffer the pool gives you if Trino's coordinator is slow. Watch latency more carefully for the Trino variant than for the others.
+
+Also, Trino is strict about types in a way the others aren't. URL params arrive as strings, and the Trino variant coerces string binds to int/float when they parse cleanly. A VARCHAR column holding only digits (a "12345" zipcode) will be over-coerced; if that matters to you, use `$filter=zipcode eq '12345'` to force a string literal.
+
+## Operational hazards and how you'll see them
+
+**A table was renamed or dropped.** Requests for that table return 404 "Table not found in schema". Fix: re-harvest (`POST /admin/refresh-schema`) or roll the pods.
+
+**A column was added.** Requests referencing it in `$select` or `$filter` return 400 "Invalid column" until re-harvest. Fix: same as above.
+
+**The DB went away.** `/ready` starts returning 503. k8s drains pods from the service endpoint list. Requests to IRIS pods that haven't drained yet return 400 "Query failed" with the DB's error message — IRIS wraps driver errors uniformly. Fix itself once the DB is back; IRIS will re-enter service.
+
+**A client is hammering the DB.** Look at the request log. Every request logs method, path, status, and duration; look for a single caller pattern generating high row counts or long durations. Cap them with `MAX_PAGE_SIZE`, or put rate limiting in the gateway.
+
+**A YAML view definition or custom query doesn't match the DDL.** On startup (and re-harvest), IRIS logs a WARNING for each YAML file that references a schema or table that isn't present. Watch for these in the log aggregator; they mean a file has drifted from the DB and callers will get 404s.
+
+**Passthrough credentials are wrong.** The error comes from the DB, wraps as `DatabaseError`, logs at ERROR level (with the username redacted per `LOG_USER_SECRET`), and returns 400 to the caller. This is the expected behavior — IRIS doesn't fall back to the service account when passthrough credentials fail, because that would silently upgrade permissions.
+
+## Rolling a new version
+
+The service is stateless and the DDL cache is cheap to rebuild. A standard rolling deploy works: k8s surges up, new pods harvest DDL and pass readiness, old pods drain. Nothing special required.
+
+If the DDL on the target DB has changed between versions, the new pods will see the new DDL and old pods will still serve queries against their cached-at-startup DDL until they're terminated. For the short overlap window, a dropped column can cause old pods to serve requests the DB then rejects. That's a latency-of-drop-in-schema-change concern, not a correctness concern.
+
+## What to alert on
+
+Minimum viable alerts:
+
+- **Readiness-probe pass rate below 100% for more than a few minutes.** Something is wrong with DB connectivity from some subset of pods.
+- **5xx rate non-zero.** IRIS itself doesn't return 5xx in normal operation — 503 is explicitly readiness, and query failures come back as 400. A 500 means something went unhandled.
+- **Startup failures.** Pod CrashLoopBackOff is most often misconfigured env vars or a DB that isn't reachable. Check logs; the lifespan handler logs its progress.
+- **DDL-mismatch warnings.** Low urgency but they indicate YAML files have drifted from the DB — eventually a caller will hit a 404.
+- **JWKS-fetch latency / failure rate** (when `AUTH__JWKS_URL` is set). Every authed request validates the JWT against keys cached from the JWKS URL; a cache miss triggers an HTTP fetch to the IDP. If that fetch is slow, every cold-start request blocks on it; if it fails (IDP outage, DNS, network partition), authed requests fail outright. Monitor at the gateway / mesh layer if possible — IRIS doesn't surface JWKS-fetch metrics today. Treat IDP outage as a paging event for the auth service, not for IRIS.
+
+## Sizing against the DB
+
+Rough math for capacity planning:
+
+```
+total connections from IRIS = HPA max replicas × pool max
+```
+
+| HPA max | Pool max | DB connections from IRIS |
+|---|---|---|
+| 2 | 10 | 20 |
+| 10 *(default)* | 10 | 100 |
+
+Make sure the target DB can handle that *in addition to* its other traffic. Per-database notes:
+
+- **Oracle SE** — licensing-tier session ceilings. Check `v$parameter` for `sessions` / `processes`.
+- **MySQL default** — `max_connections=151`. 10 pods × 10 = 100 is fine; 20 pods × 10 starts cutting into headroom.
+- **Postgres default** — `max_connections=100`. Default IRIS pool sizing fits, but no headroom for other consumers.
+
+### Pool-sizing report at startup
+
+Each pod logs a single INFO event after the DDL harvest with the math worked out for your specific DB and configuration. Example for a default-tuned MySQL deployment:
+
+```
+Pool sizing report
+  DB max_connections:    151    (MySQL @@max_connections)
+  Pool configured:       min=2, max=10
+  Expected replica peak: 10    (HPA_MAX_REPLICAS)
+  Total at peak:         100 connections    (66% of DB capacity)
+  Recommendations:
+    pool_max=8    uses  53%  (ok)
+    pool_max=10   uses  66%  (ok) ← current
+    pool_max=12   uses  79%  (caution)
+    pool_max=15   uses  99%  (unsafe)
+```
+
+When the DB doesn't expose a queryable limit (Trino has no concept; Oracle metadata-only accounts may lack `v$parameter` SELECT), the report says "unknown" with the reason and skips recommendations rather than failing startup.
+
+The same payload is available as JSON at `GET /admin/pool-sizing` (gated by `X-Admin-Token`). Useful for runbook scripts and dashboards without log access.
+
+The report is **advice, not policy** — IRIS doesn't know about other DB consumers (BI tools, crons, sibling services), so the verdict is based on incomplete information. Use it as a sanity check, not an autopilot.
+
+### Readiness probe load
+
+Default `periodSeconds=10` on the readiness probe. At HPA 2–10 replicas, that's 0.2–1 QPS of `SELECT 1` total from probe traffic across all pods. Negligible for any DB.
+
+If it's still a concern (e.g. licensing-constrained Oracle SE), dial down probe frequency in the manifest or set `READINESS_TIMEOUT_MS=0` to skip the DB hit entirely.
+
+### Passthrough load
+
+Each request that sends `X-DB-Authorization` opens a fresh DB connection and closes it at the end. The auth handshake adds an extra round-trip per request — not a concern at modest QPS, a real bottleneck at hundreds of QPS of passthrough traffic.
+
+## Quick setup for a dev environment
+
+Spin up all five databases seeded with a toy `products` schema using `test-infra/docker-compose.yml`:
+
+```bash
+cd test-infra && docker compose up -d
+```
+
+Then point each variant at the appropriate port on localhost — the compose file has a connection cheat sheet at the bottom, including the split between metadata-only and passthrough service accounts. Build and run any variant image with its `.env.example` as a starting point.
+
+For automated coverage of all five variants against live DBs, the GitHub Actions workflow `.github/workflows/variant-integration.yml` does this on every PR targeting `main`. To run the same suite locally, bring up the compose stack and `pytest` each variant's `tests/test_integration.py` with the connection env vars pointing at the compose ports — the cheat sheet at the bottom of `docker-compose.yml` lists those.
+
+## External configuration
+
+`CONFIG__SOURCE` selects where IRIS reads `validation/` and `queries/` YAMLs from at runtime. Three values:
+
+- `local` — image-baked YAMLs (fine for evaluation, dev, and small static deployments)
+- `git` — clones an external config repo on startup; the recommended production pattern when devs > SREs
+- `db` — reads from a per-deployment Postgres database; one config server can serve many IRIS deployments
+
+Each pattern has its own setup, auth, lifecycle, and trust boundary. **See [external-configuration.md](external-configuration.md) for the full walkthrough**, including migration recipes, dev → UAT → prod promotion mechanics, and troubleshooting per source.
+
+## Getting TLS in front of IRIS
+
+There are three reasonable patterns. Pick the one that matches your environment; the right answer depends on what's already there, not on what IRIS supports.
+
+1. **Terminate at the ingress / mesh** *(default recommendation)*. A k8s ingress controller (NGINX, Traefik), service mesh (Istio, Linkerd), or cloud load balancer terminates TLS and forwards plain HTTP to IRIS over the pod network. Cert lifecycle (issuance, renewal, rotation) is handled by the platform — typically cert-manager + Let's Encrypt or your internal CA. IRIS itself stays plain-HTTP. This is the path most production deployments take.
+2. **Sidecar terminator in the same pod.** An nginx or envoy sidecar shares the pod's network namespace, listens TLS on 443, and proxies to IRIS on 8000. Useful when you don't run a mesh but want per-pod TLS without operator-IRIS coupling. Same cert-lifecycle responsibility as option 1, just scoped to the pod.
+3. **Native TLS via env vars.** Set both `TLS_CERT_FILE` and `TLS_KEY_FILE`; the entrypoint launches uvicorn with `--ssl-certfile` / `--ssl-keyfile` and IRIS terminates TLS on port 8000 itself. Useful when (a) you don't have a mesh and a sidecar is more friction than it's worth, (b) the deployment is small / on-prem / dev, or (c) an audit requirement says every internal service must serve TLS and you'd rather not add another moving part.
+
+Native TLS limitations: cert rotation is operator-driven (mount the new files, send the pod a SIGHUP or roll the deployment); there's no ACME automation; there's no mTLS / client-cert validation. If you need any of those, use option 1 or 2.
+
+## Hardening recommendations for production
+
+1. **Hardened base image.** Three pre-built variants are published per release — pick the tag suffix that matches your security posture:
+
+    ```bash
+    # Default — python:3.12-slim runtime. Anyone can pull.
+    docker pull ghcr.io/baelfur/app-postgres:X.Y.Z
+
+    # Free hardened — gcr.io/distroless/python3-debian12 runtime. Anyone can pull.
+    # No shell at runtime; entrypoint is Python so it works.
+    docker pull ghcr.io/baelfur/app-postgres:X.Y.Z-distroless
+
+    # Vendor-curated hardened — Docker Hardened Images runtime.
+    # Requires a Docker Hub subscription with DHI entitlement to pull.
+    docker login
+    docker pull ghcr.io/baelfur/app-postgres:X.Y.Z-dhi
+    ```
+
+    See [Versioning — Docker image tag convention](../reference/versioning.md#docker-image-tag-convention) for the full tag matrix. Want a base IRIS doesn't pre-publish (Chainguard, Iron Bank, private hardened registry)? Build it yourself by overriding the `BASE_IMAGE` build-arg:
+
+    ```bash
+    docker build --build-arg BASE_IMAGE=<your-org-approved-image> \
+      -f variants/postgres/Dockerfile -t app-postgres:hardened .
+    ```
+
+    Run as non-root in production regardless of base image.
+2. **Read-only DB user** (or dual-user + passthrough). IRIS never writes — enforce that at the DB role level, not by trust.
+3. **`ERROR_DETAIL`** is `terse` by default — leave it for public-ish callers. Set to `safe` if you want machine consumers to branch on stable failure codes (`db.bad_credentials`, `db.connection_refused`, `db.permission_denied`, `db.timeout`, `db.query_failed`) without leaking topology. Flip to `verbose` only inside the trust perimeter.
+4. **TLS between caller and IRIS.** Pick one of the three patterns above. Passthrough sends Basic auth headers; the lane has to be encrypted somewhere.
+5. **Do not expose IRIS directly to the internet.** An API gateway handles rate limiting, WAF rules, and first-line authN — that stays true even with native TLS enabled.

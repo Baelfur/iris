@@ -1,0 +1,6 @@
+params:
+  required:
+    - id
+  optional:
+    - category
+    - name

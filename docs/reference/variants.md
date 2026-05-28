@@ -1,0 +1,120 @@
+# Variants
+
+IRIS ships five variants — one per supported database. Pick the one that matches your DB; deploy that variant only. The shared core (`core/`) is built into each variant's image.
+
+| Directory | Database | Driver | Official? |
+|---|---|---|---|
+| `variants/oracle/` | Oracle | `oracledb` | ✅ Yes |
+| `variants/postgres/` | PostgreSQL | `psycopg` + `psycopg-pool` | ✅ Yes |
+| `variants/mysql/` | MySQL | `aiomysql` | ❌ Community |
+| `variants/mariadb/` | MariaDB | `aiomysql` | ❌ Community |
+| `variants/trino/` | Trino | `aiotrino` | ❌ Community |
+
+---
+
+## Driver choice rationale
+
+IRIS is async throughout. Every query goes through a coroutine so the event loop isn't blocked by a slow backend. That means the driver must support async natively:
+
+- **Oracle** — `oracledb` (official, async-capable)
+- **PostgreSQL** — `psycopg` v3 with `psycopg-pool` (official, async-capable)
+- **MySQL** — `mysql-connector-python` is sync-only. We use `aiomysql` (community).
+- **MariaDB** — `mariadb` package is sync-only. We use `aiomysql` (community) — same wire protocol, same driver works.
+- **Trino** — `aiotrino` (community) is the only async Trino DB-API client with traction.
+
+If/when MySQL or MariaDB ship an official async driver, the respective variants should migrate.
+
+---
+
+## URL patterns
+
+```
+GET /{schema}/{table}?<params>
+```
+
+What `schema` maps to depends on the DB:
+
+| Database | URL Maps To | Notes |
+|---|---|---|
+| Oracle | `{schema}.{table}` | Schema = Oracle owner |
+| PostgreSQL | `{schema}.{table}` | Database pinned via `PG_DATABASE` |
+| MySQL | `{database}.{table}` | MySQL's "database" is its schema unit |
+| MariaDB | `{database}.{table}` | Same as MySQL |
+| Trino | `{catalog}.{schema}.{table}` | Catalog pinned via `TRINO_CATALOG`; also accepts a 3-segment URL `/{catalog}/{schema}/{table}` (catalog must match the configured one) |
+
+---
+
+## Per-variant quirks
+
+### Oracle (`variants/oracle/`)
+
+- **Paramstyle:** `named` — SQL uses `:p_col` placeholders, binds are a dict
+- **Pagination:** `OFFSET n ROWS FETCH NEXT m ROWS ONLY`
+- **Identifier case:** Oracle stores unquoted identifiers as uppercase. The DDL cache keys are lowercase, but emitted SQL uppercases the schema and table (`SELECT ... FROM SCHEMA.TABLE`). User-facing URLs are case-insensitive.
+- **DDL source:** `ALL_TAB_COLUMNS` filtered by `OWNER IN (...)`
+- **Quirks:** `SELECT 1` is not valid standalone Oracle SQL — ping query is `SELECT 1 FROM DUAL`
+- **Service vs SID:** IRIS connects via `ORACLE_SERVICE` (service name, not SID). Set `ORACLE_HOST`, `ORACLE_PORT`, `ORACLE_SERVICE`, `ORACLE_USER`, `ORACLE_PASSWORD`.
+
+### PostgreSQL (`variants/postgres/`)
+
+- **Paramstyle:** `pyformat` — `%(p_col)s` placeholders, dict binds
+- **Pagination:** `LIMIT m OFFSET n`
+- **Identifier case:** stored lowercase
+- **DDL source:** `information_schema.columns` filtered by `table_schema IN (...)`
+- **Quirks:** none significant — this is the reference variant
+- **Database vs schema:** Postgres separates them. `PG_DATABASE` pins the database at connection time; the URL path is the schema.
+
+### MySQL (`variants/mysql/`)
+
+- **Paramstyle:** `pyformat`
+- **Pagination:** `LIMIT m OFFSET n` — **LIMIT must come first**, unlike Postgres which accepts either order
+- **Identifier case:** stored lowercase (on case-insensitive platforms) or as declared (on case-sensitive); behavior varies by `lower_case_table_names` system var
+- **DDL source:** `information_schema.columns`
+- **Quirks:** `MYSQL_DATABASE` is MySQL's "schema." The URL path represents the database within the MySQL instance.
+
+### MariaDB (`variants/mariadb/`)
+
+- **Same as MySQL.** MariaDB forked from MySQL 5.5 and is wire-compatible. Uses the same `aiomysql` driver and mostly the same SQL.
+- Separate variant because:
+  - Different env-var namespace (`MARIADB_*` vs `MYSQL_*`)
+  - Independent upgrade cycle
+  - Occasional behavioral divergence that may need separate handling later
+
+### Trino (`variants/trino/`)
+
+- **Paramstyle:** `qmark` — `?` placeholders, binds are a positional list
+- **Pagination:** `OFFSET n LIMIT m` — **OFFSET must come first** (the opposite of MySQL)
+- **Catalog pinned via `TRINO_CATALOG`** — the URL's schema is the schema within that catalog
+- **3-segment URL also accepted** — `/{catalog}/{schema}/{table}` works alongside `/{schema}/{table}`. The catalog segment must match `TRINO_CATALOG` (case-insensitive); other catalogs return 404 because the DDL cache only validates against the configured one. Cross-catalog querying would require harvesting `information_schema` across all reachable catalogs and isn't in this surface. The 3-seg path matches the legacy `flaskdsl-trino` URL shape so consumers can migrate without rewriting client URLs.
+- **DDL source:** `information_schema.columns` within the pinned catalog
+- **Quirks (the one to actually watch for):**
+  - **Strict typing** — Trino refuses `varchar = integer` comparisons. URL params arrive as strings; the Trino variant best-effort coerces numeric-looking binds to `int`/`float` before sending so `?id=1` works against `INTEGER id`. Edge case: a VARCHAR column holding digits (zipcodes, leading-zero codes) gets over-coerced. Use `$filter` with an explicit string literal (`$filter=zipcode eq '12345'`) to bypass coercion.
+  - **No real connection pool** — `aiotrino.Connection.close()` tears down the underlying aiohttp connector, so sharing a session across queries isn't safe. The variant keeps a single long-lived Connection for the life of the process and creates fresh cursors per query.
+  - **Basic auth requires HTTPS** — Trino rejects HTTP Basic over plain HTTP. Set `TRINO_SCHEME=https` when using [credential passthrough](../user-guide/security-posture.md#passthrough-over-http) against Trino.
+
+---
+
+## Feature support matrix
+
+| Feature | PG | MySQL | MariaDB | Oracle | Trino |
+|---|---|---|---|---|---|
+| `$select` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `$filter` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `$orderby` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Pagination (`$count` + `$start_index`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Safe params (`?col=val`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Custom YAML queries | ✅ | ✅ | ✅ | ✅ | ✅ |
+| View definitions | ✅ | ✅ | ✅ | ✅ | ✅ |
+| JWT auth | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Credential passthrough | ✅ | ✅ | ✅ | ✅ | ✅ (needs https) |
+| DDL validation | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Readiness probe (`/ready`) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Connection pooling | ✅ | ✅ | ✅ | ✅ | ⚠️ no real pool — see Trino section above |
+
+---
+
+## Related
+
+- [Architecture](architecture.md) — the patterns that make supporting all 5 from one codebase tractable
+- [Using IRIS](../user-guide/using.md) — how these differences show up (and don't) in the API surface
+- [Security posture](../user-guide/security-posture.md) — per-variant security notes (especially Trino + Basic auth)

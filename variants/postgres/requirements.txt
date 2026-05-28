@@ -1,0 +1,7 @@
+# Driver + runtime-server deltas only. fastapi, pydantic-settings, PyJWT,
+# pyyaml, pytest, pytest-asyncio, httpx, asgi-lifespan come from core
+# (and its [test] extra) — installed first by the Dockerfile and CI. Floor
+# pins match the API surface we use; revisit on major bumps. (#45, #198)
+uvicorn[standard]>=0.27
+psycopg[binary]>=3.1
+psycopg-pool>=3.2

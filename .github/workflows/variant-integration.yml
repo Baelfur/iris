@@ -1,0 +1,268 @@
+name: Variant Integration Tests
+
+# Runs each variant's test_integration.py against a live DB on PRs
+# targeting main. This is the e2e gate before a release window — the
+# dev → main promotion PR cannot merge without all 5 variants passing
+# their integration suite.
+#
+# Each variant is its own job with its own DB service container.
+# Init SQL from test-infra/init-*.sql is executed once the DB is up.
+# Wall clock bounded by the slowest variant (Oracle); other variants
+# finish in 1-2 minutes.
+#
+# Oracle is marked continue-on-error initially because GHA + Oracle XE
+# is famously flaky on first-boot timing. Once we see it run green
+# reliably for a few cycles, flip continue-on-error to false to make
+# Oracle a required check too.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: app
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            core/pyproject.toml
+            variants/postgres/requirements.txt
+      - name: Seed Postgres with test data + meta/passthrough users
+        env:
+          PGPASSWORD: testpass
+        run: psql -h localhost -U postgres -d app -f test-infra/init-postgres.sql
+      - name: Install dependencies
+        run: |
+          pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+          pip install -r variants/postgres/requirements.txt
+      - name: Run postgres integration tests
+        # Pool user is `postgres` (superuser) so non-passthrough data
+        # queries succeed. The init script's `metadata_user` (REFERENCES
+        # only) and `passthrough_user` (SELECT) users are reserved for tests
+        # that exercise the metadata-vs-data grant split — passthrough
+        # tests use passthrough_user via the conftest fixture.
+        env:
+          PG_HOST: localhost
+          PG_PORT: "5432"
+          PG_USER: postgres
+          PG_PASSWORD: testpass
+          PG_DATABASE: app
+          CONFIG__SOURCE: local
+        run: cd variants/postgres && python -m pytest tests/test_integration.py -v
+
+  mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: testpass
+          MYSQL_DATABASE: public
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -ptestpass"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            core/pyproject.toml
+            variants/mysql/requirements.txt
+      - name: Seed MySQL with test data + meta/passthrough users
+        run: mysql -h 127.0.0.1 -P 3306 -uroot -ptestpass public < test-infra/init-mysql.sql
+      - name: Install dependencies
+        run: |
+          pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+          pip install -r variants/mysql/requirements.txt
+      - name: Run mysql integration tests
+        # Pool user is `root` so non-passthrough data queries succeed.
+        # metadata_user / passthrough_user from the init script are reserved for
+        # the metadata-vs-data grant split tests; passthrough tests use
+        # passthrough_user via the conftest fixture.
+        env:
+          MYSQL_HOST: 127.0.0.1
+          MYSQL_PORT: "3306"
+          MYSQL_USER: root
+          MYSQL_PASSWORD: testpass
+          MYSQL_DATABASE: public
+          CONFIG__SOURCE: local
+        run: cd variants/mysql && python -m pytest tests/test_integration.py -v
+
+  mariadb:
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: testpass
+          MARIADB_DATABASE: public
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            core/pyproject.toml
+            variants/mariadb/requirements.txt
+      - name: Seed MariaDB with test data + meta/passthrough users
+        run: mysql -h 127.0.0.1 -P 3306 -uroot -ptestpass public < test-infra/init-mysql.sql
+      - name: Install dependencies
+        run: |
+          pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+          pip install -r variants/mariadb/requirements.txt
+      - name: Run mariadb integration tests
+        # Pool user is `root` so non-passthrough data queries succeed.
+        # metadata_user / passthrough_user from the init script are reserved for
+        # the metadata-vs-data grant split tests; passthrough tests use
+        # passthrough_user via the conftest fixture.
+        env:
+          MARIADB_HOST: 127.0.0.1
+          MARIADB_PORT: "3306"
+          MARIADB_USER: root
+          MARIADB_PASSWORD: testpass
+          MARIADB_DATABASE: public
+          CONFIG__SOURCE: local
+        run: cd variants/mariadb && python -m pytest tests/test_integration.py -v
+
+  trino:
+    runs-on: ubuntu-latest
+    services:
+      trino:
+        image: trinodb/trino:latest
+        ports: ["8080:8080"]
+        options: >-
+          --health-cmd "curl -sf http://localhost:8080/v1/info"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            core/pyproject.toml
+            variants/trino/requirements.txt
+      - name: Install dependencies
+        run: |
+          pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+          pip install -r variants/trino/requirements.txt
+      - name: Run trino integration tests
+        # Trino seeds its memory.public.products via conftest fixture —
+        # no init-SQL step needed. ALLOWED_SCHEMAS narrows DDL harvest
+        # to public so we don't pull in Trino's system catalogs.
+        env:
+          TRINO_HOST: localhost
+          TRINO_PORT: "8080"
+          TRINO_USER: app
+          TRINO_CATALOG: memory
+          TRINO_SCHEME: http
+          ALLOWED_SCHEMAS: '["public"]'
+          CONFIG__SOURCE: local
+        run: cd variants/trino && python -m pytest tests/test_integration.py -v
+
+  oracle:
+    runs-on: ubuntu-latest
+    # Oracle XE in GHA is known-flaky on first-boot timing. Marking
+    # continue-on-error so a flake doesn't block the gate. Flip to
+    # false once we've seen this run green for a few cycles.
+    continue-on-error: true
+    services:
+      oracle:
+        image: gvenzl/oracle-free:slim
+        env:
+          ORACLE_PASSWORD: testpass
+          APP_USER: public_user
+          APP_USER_PASSWORD: testpass
+        ports: ["1521:1521"]
+        options: >-
+          --health-cmd "healthcheck.sh"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 20
+          --health-start-period 60s
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            core/pyproject.toml
+            variants/oracle/requirements.txt
+      - name: Seed Oracle with products table
+        # gvenzl/oracle-free already creates `public_user` from the
+        # APP_USER env var with CONNECT + RESOURCE roles (which include
+        # CREATE TABLE), so we just create the products table inline as
+        # public_user and skip the init-oracle.sql file (which tries to
+        # re-create the user — fails — and uses ALTER SESSION SET CONTAINER
+        # which only works as SYSDBA).
+        #
+        # Note the `-i` on docker exec — without it, stdin isn't piped to
+        # the container, so the SQL silently no-ops. (Caught locally with
+        # the compose stack.)
+        run: |
+          docker exec -i $(docker ps -q --filter "ancestor=gvenzl/oracle-free:slim") \
+            sqlplus -s public_user/testpass@//localhost:1521/FREEPDB1 <<'EOF'
+          CREATE TABLE products (
+              id NUMBER PRIMARY KEY,
+              name VARCHAR2(255),
+              category VARCHAR2(100),
+              price NUMBER(10,2),
+              in_stock NUMBER(1)
+          );
+          INSERT INTO products VALUES (1, 'Laptop', 'electronics', 999.99, 1);
+          INSERT INTO products VALUES (2, 'T-Shirt', 'clothing', 19.99, 1);
+          INSERT INTO products VALUES (3, 'Headphones', 'electronics', 149.99, 1);
+          INSERT INTO products VALUES (4, 'Jeans', 'clothing', 49.99, 0);
+          INSERT INTO products VALUES (5, 'Keyboard', 'electronics', 79.99, 1);
+          INSERT INTO products VALUES (6, 'Sneakers', 'clothing', 89.99, 1);
+          COMMIT;
+          EXIT;
+          EOF
+      - name: Install dependencies
+        run: |
+          pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+          pip install -r variants/oracle/requirements.txt
+      - name: Run oracle integration tests
+        env:
+          ORACLE_HOST: localhost
+          ORACLE_PORT: "1521"
+          ORACLE_SERVICE: FREEPDB1
+          ORACLE_USER: public_user
+          ORACLE_PASSWORD: testpass
+          CONFIG__SOURCE: local
+        run: cd variants/oracle && python -m pytest tests/test_integration.py -v

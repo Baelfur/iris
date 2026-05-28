@@ -1,0 +1,95 @@
+name: Dockerfile Build Smoke Test
+
+# Builds postgres against three base images on Dockerfile-affecting
+# changes AND on release-please PRs. All 5 variants share the same
+# Dockerfile shape, so postgres alone validates the base + build
+# chain — extending to a 5-variant matrix would 5x the cost without
+# adding signal.
+#
+# Three bases:
+#   - slim:       python:3.12-slim                       (default, free, anonymous)
+#   - distroless: gcr.io/distroless/python3-debian12     (free, anonymous, no shell)
+#   - dhi:        dhi/python:3.12                        (Docker Hardened, requires DH auth)
+#
+# DHI is gated on `vars.DH_AUTH_AVAILABLE == 'true'` (a repo variable
+# the operator sets after configuring DOCKERHUB_USERNAME +
+# DOCKERHUB_TOKEN secrets). When unset, the dhi job is skipped — no
+# false-red CI for forks / contributors without DH subscriptions.
+#
+#
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - '**/Dockerfile'
+      - 'scripts/entrypoint.py'
+      - 'core/pyproject.toml'
+      - '.release-please-manifest.json'
+      - '.github/workflows/build-smoke.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - '**/Dockerfile'
+      - 'scripts/entrypoint.py'
+      - 'core/pyproject.toml'
+      - '.release-please-manifest.json'
+      - '.github/workflows/build-smoke.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-slim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Build postgres on python:3.12-slim
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/postgres/Dockerfile
+          build-args: BASE_IMAGE=python:3.12-slim
+          push: false
+          load: false
+          tags: app-postgres:smoke-slim
+
+  build-distroless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Build postgres on gcr.io/distroless/python3-debian12
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/postgres/Dockerfile
+          build-args: BASE_IMAGE=gcr.io/distroless/python3-debian12
+          push: false
+          load: false
+          tags: app-postgres:smoke-distroless
+
+  build-dhi:
+    runs-on: ubuntu-latest
+    # Only run when the operator has configured Docker Hub auth + flagged
+    # this repo as having DHI access. See workflow header for details.
+    if: vars.DH_AUTH_AVAILABLE == 'true'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build postgres on dhi/python:3.12
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/postgres/Dockerfile
+          build-args: BASE_IMAGE=dhi/python:3.12
+          push: false
+          load: false
+          tags: app-postgres:smoke-dhi

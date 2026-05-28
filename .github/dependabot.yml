@@ -1,0 +1,95 @@
+version: 2
+
+# Dependabot configured for security updates only. Version-update PRs
+# are disabled (`open-pull-requests-limit: 0`) — GitHub still opens
+# Dependabot PRs for advisories that affect a pinned dependency, but
+# routine "newer version exists" churn is suppressed.
+#
+# Why: pre-1.0 the floor pins in pyproject.toml and the variants'
+# requirements.txt match the API surface the service actually uses. Chasing
+# major-version bumps for their own sake is busywork; the lint
+# baseline + tests are green on the current pins, and pip-audit (in
+# unit-tests.yml) catches CVEs independently. Revisit a more active
+# upgrade cadence post-1.0 once there are clients to coordinate
+# breaking changes with.
+#
+# Coverage stays the same — core/, all five variants, github-actions
+# — so when an advisory does land, Dependabot still sees the manifest.
+
+updates:
+  - package-ecosystem: pip
+    directory: /core
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5
+
+  - package-ecosystem: pip
+    directory: /variants/postgres
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5
+
+  - package-ecosystem: pip
+    directory: /variants/mysql
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5
+
+  - package-ecosystem: pip
+    directory: /variants/mariadb
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5
+
+  - package-ecosystem: pip
+    directory: /variants/oracle
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5
+
+  - package-ecosystem: pip
+    directory: /variants/trino
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: dev
+    open-pull-requests-limit: 0
+    labels:
+      - dependencies
+      - security
+      - tier-5

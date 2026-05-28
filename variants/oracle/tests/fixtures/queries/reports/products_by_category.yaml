@@ -1,0 +1,7 @@
+sql: |
+  SELECT id, name, category, price
+  FROM public_user.products
+  WHERE category = :category
+params:
+  required:
+    - category

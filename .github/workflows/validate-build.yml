@@ -1,0 +1,44 @@
+name: Validate Build
+
+# Builds all 5 variants on PRs targeting main as a release-window gate.
+# Single-arch (linux/amd64) — fast enough to be a required check; the
+# release-time multi-arch build (release.yml) handles the cross-arch
+# publish. Doesn't push anywhere — just confirms the build chain works
+# end-to-end on the source state about to be merged.
+#
+# No path filter: this fires on every PR to main, regardless of what
+# changed. PRs that don't touch build-affecting paths still pass
+# vacuously (build is fast). That's the cost of having this be a
+# required check — required checks need to actually run.
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [postgres, oracle, mysql, mariadb, trino]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v4
+      - name: Build ${{ matrix.variant }} variant (single-arch, no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: variants/${{ matrix.variant }}/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: false
+          # GHA cache to keep iterative re-runs cheap. Same scope name
+          # as release.yml so the on-tag publish gets warm cache from
+          # this gate's run.
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}

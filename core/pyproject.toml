@@ -1,0 +1,170 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "core"
+version = "1.0.0"
+description = "Shared core for the REST-over-database layer — database-agnostic logic"
+requires-python = ">=3.12"
+# Floor pins on each dep — the lower bound is the earliest version that
+# carries the API surface we use, so a pip install can't pick up a
+# pre-API older release. Ceiling pins on packages with known major-
+# breaking-change history (Pydantic v1 → v2 was the canonical case;
+# pydantic-settings followed). Every other dep gets just a floor and we
+# revisit if a breaking major lands.
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic-settings>=2.0,<3",
+    "PyJWT[crypto]>=2.8",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "httpx>=0.27",
+    # Drives the FastAPI lifespan in variant integration tests (each
+    # variant's conftest uses LifespanManager to bring up the app).
+    # Was implicitly relied on via local .venv setup pre-CI; declared
+    # explicitly here so pip installs it in fresh GHA runners.
+    "asgi-lifespan>=2.0",
+]
+# Lint extra — ruff replaces flake8 / isort / pyupgrade / pep8-naming
+# in one fast tool. mypy is a separate concern (type checking) but
+# both are static analysis tools, so they share a place.
+lint = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+    # Drives the doc-templating drift check (`python docs/build.py
+    # --check`). The build script renders `*.md.tmpl` → `*.md` via
+    # Jinja2 substitution from `docs/_config.yml`. CI fails on drift
+    # so a template edit without a rebuild can't ship.
+    "jinja2>=3.0",
+    # Docstring coverage gate. Configured under [tool.interrogate]
+    # below; CI runs `interrogate -c core/pyproject.toml core/core`
+    # and fails when the floor drops.
+    "interrogate>=1.5",
+]
+# Optional Prometheus /metrics endpoint. When enabled via
+# ENABLE_METRICS=true, core.metrics.maybe_register attaches the
+# instrumentator + exposes /metrics on each variant's FastAPI app.
+metrics = ["prometheus-fastapi-instrumentator>=7.0"]
+# Optional OpenTelemetry tracing. Activates when
+# OTEL_EXPORTER_OTLP_ENDPOINT is set. core.tracing.maybe_register
+# sets up the TracerProvider + OTLP exporter and attaches FastAPI
+# auto-instrumentation. Driver-level DB span instrumentors are bundled
+# here but only register at runtime when ENABLE_DB_TRACING is
+# also true — gated to avoid shipping SQL in spans by default. Only
+# the drivers with PyPI-published OTel instrumentors are included:
+# psycopg and oracledb. aiomysql (mysql + mariadb variants) and
+# aiotrino have no official PyPI-published OTel instrumentor — those
+# variants log a documented gap when ENABLE_DB_TRACING=true rather
+# than register. (mysql-connector-python and pymysql have
+# instrumentors but the service uses aiomysql, so they don't apply.)
+tracing = [
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.30",
+    "opentelemetry-instrumentation-psycopg>=0.51b0",
+    # oracledb instrumentor is a much newer package than the others —
+    # versioning starts at 0.1.0 (not the 0.51b0+ OTel ecosystem stream).
+    # Floor matches what's actually published.
+    "opentelemetry-instrumentation-oracledb>=0.1.0",
+]
+# Optional external git config source. Pure-Python git client, no
+# system `git` binary required in the image.
+config-git = ["dulwich>=0.22"]
+# Optional config-DB source. The config DB is always Postgres
+# regardless of which DB the variant fronts, so this needs psycopg
+# even on Trino / Oracle / MySQL deployments.
+config-db = ["psycopg[binary]>=3.1"]
+# Optional Kafka log-stream sink. When KAFKA_BROKERS is set, the
+# root logger gains a queue-buffered KafkaHandler emitting the same JSON
+# envelope going to stdout. confluent-kafka chosen for librdkafka's
+# proven multi-producer behavior; aiokafka was the alternative.
+kafka = ["confluent-kafka>=2.0"]
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.pytest.ini_options]
+# Pin the asyncio default fixture loop scope explicitly so pytest-asyncio
+# stops printing a PytestDeprecationWarning on every test run. "function"
+# matches the existing default (each test gets a fresh event loop) and is
+# what every async test in the suite already assumes.
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+# Coverage scope is `core`'s runtime code only. Tests + fixture
+# helpers (testing/) are excluded from the measurement target —
+# they're meta-code, not the artifact under test.
+source = ["core"]
+omit = [
+    "core/testing/*",
+    # __init__.py files are typically pure re-exports; their
+    # "coverage" doesn't represent real behavior.
+    "core/**/__init__.py",
+]
+
+[tool.coverage.report]
+# fail_under threshold prevents silent regressions. Initial value is
+# conservative; ratchet up over time as test debt clears.
+fail_under = 80
+show_missing = true
+skip_covered = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Sane default ruleset: pyflakes (F), pycodestyle (E, W),
+# pyupgrade (UP), bugbear (B), simplify (SIM), isort (I).
+# E501 disabled — line-length is enforced by the formatter, no need
+# for the linter to also flag it.
+select = ["E", "W", "F", "UP", "B", "SIM", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files commonly use module-level setup that triggers spurious
+# warnings; relax there.
+"tests/**" = ["B011", "SIM117"]
+
+[tool.mypy]
+# Initial scope: `core` only. Variants use their own driver packages
+# whose stubs are uneven; we'll widen scope once `core` is clean.
+# Strict-untyped-defs catches missing return type annotations without
+# going full --strict (which is too aggressive for an existing
+# codebase).
+files = ["core"]
+python_version = "3.12"
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Many third-party libs lack stubs; ignore-missing-imports keeps mypy
+# focused on `core`'s own typing rather than churning on missing
+# fastapi / pydantic / psycopg stubs.
+ignore_missing_imports = true
+
+[tool.interrogate]
+# Docstring coverage gate. Scoped to `core/core/`; variants are
+# thin per-driver adapters and don't carry public-API contracts the
+# way core does.
+#
+# Exclusions reflect "things that aren't public-API surface readers
+# of `core` would document themselves on":
+#   - __init__.py module files: many are bare re-exports
+#   - private / semi-private (_foo, __foo): not public
+#   - testing/: shared test scaffolding, not runtime API
+fail_under = 80
+ignore_init_module = true
+ignore_private = true
+ignore_semiprivate = true
+exclude = ["core/testing"]
+# Quiet mode so CI logs aren't noisy; only fail/pass + percentage prints.
+quiet = false
+color = true

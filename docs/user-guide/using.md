@@ -1,0 +1,426 @@
+# Using IRIS
+
+This is the integrator's guide. You're writing a client — a script, a dashboard, a service — that calls IRIS to read from a database.
+
+## The mental model
+
+Every table in an allowed schema becomes a URL. That URL is:
+
+```
+GET /{schema}/{table}
+```
+
+Parameters fall into two families:
+
+- **Reserved parameters** start with `$` (`$select`, `$filter`, `$orderby`, `$count`, `$start_index`, `$cursor`, `$groupby`, `$having`). They shape the query.
+- **Simple parameters** are bare names (`id`, `category`, `status`). Each one becomes an equality filter: `?id=4821&category=electronics` means `WHERE id = 4821 AND category = 'electronics'`.
+
+The two families compose. You can mix `?category=electronics&$filter=price gt 10&$count=20&$orderby=created_at` in one call.
+
+Responses are JSON and always have this shape:
+
+```json
+{
+  "name": "orders",
+  "elements": [
+    {"id": 4821, "total": 129.95, "status": "open"}
+  ],
+  "links": [
+    {"rel": "next", "title": "Next interval", "href": "?$count=50&$start_index=50"}
+  ]
+}
+```
+
+`links` is absent when there isn't another page.
+
+## The `$filter` grammar
+
+`$filter` is the piece that does most of the work. It's a deliberately small expression language — not SQL, not OData in full. Learn it once and it works identically across Postgres, MySQL, MariaDB, Oracle, and Trino.
+
+### Comparisons
+
+```
+id eq 4821
+status ne 'closed'
+price gt 99.99
+price ge 100
+price lt 50
+price le 49.99
+```
+
+Operators are always three characters: `eq ne gt ge lt le`. They go between a column name and a literal. You cannot compare two columns — only a column against a number or a string.
+
+### Strings and numbers
+
+Strings are single-quoted. To include a literal single quote, double it:
+
+```
+name eq 'O''Brien'
+```
+
+Numbers can be integers or decimals, and negatives are fine:
+
+```
+price gt -5
+discount_rate lt 0.15
+```
+
+### Null
+
+Null has its own shape. It only goes with `eq` and `ne`:
+
+```
+shipped_at eq null         -- maps to IS NULL
+shipped_at ne null         -- maps to IS NOT NULL
+```
+
+`price gt null` is a syntax error, not a no-match. This is deliberate.
+
+### `in` lists
+
+```
+category in ('electronics', 'books', 'media')
+id in (1, 2, 3, 5, 8)
+```
+
+At least one value is required. Mixing types inside an `in` list is permitted structurally, but your database will likely reject it at execution time.
+
+### Boolean combinators
+
+```
+status eq 'open' and total gt 100
+category eq 'books' or category eq 'media'
+not status eq 'closed'
+```
+
+Precedence: `not` binds tightest, then `and`, then `or`. Use parentheses when in doubt:
+
+```
+(category eq 'books' or category eq 'media') and price lt 50
+```
+
+### What the grammar doesn't support
+
+- `LIKE` / pattern matching
+- `BETWEEN`
+- function calls (`LOWER(name) eq 'foo'`, `TRIM(x) eq 'y'`)
+- subqueries
+- comparing one column to another
+
+If you need any of these, ask the operator to add a **custom query** (see below). The grammar is closed on purpose — it's what makes IRIS safe to expose without hand-reviewing each caller's request.
+
+### There is no boolean literal
+
+IRIS doesn't take `true` / `false` in filters. If your column stores `1`/`0` or `'Y'`/`'N'`, filter against that literal:
+
+```
+is_active eq 1
+verified eq 'Y'
+```
+
+This is intentional — it avoids driver-specific boolean coercion and stays honest about what's in the column.
+
+### Quick grammar reference
+
+In EBNF-ish notation, for reaching-for-it use:
+
+```
+expr        := or-expr
+or-expr     := and-expr ("or" and-expr)*
+and-expr    := not-expr ("and" not-expr)*
+not-expr    := "not"? primary
+primary     := "(" expr ")" | comparison | in-expr
+comparison  := ident ("eq"|"ne") (literal | "null")
+             | ident ("gt"|"ge"|"lt"|"le") literal
+in-expr     := ident "in" "(" literal ("," literal)* ")"
+ident       := [A-Za-z_][A-Za-z0-9_]*   (validated against the DDL cache)
+literal     := number | single-quoted-string
+```
+
+## `$select` — column projection
+
+Comma-separated list of columns to return. Without it, you get `SELECT *`.
+
+```
+GET /reporting/orders?$select=id,total,status&$filter=id eq 4821
+```
+
+Invalid column names are rejected with `400 Invalid column(s): xyz` before any SQL is issued.
+
+## `$orderby` — ordering
+
+Takes a column name, optionally with `ASC` or `DESC`:
+
+```
+$orderby=created_at DESC
+$orderby=status ASC, created_at DESC
+```
+
+Only the column identifier is validated against the DDL cache. `$orderby=bogus` fails at the request edge.
+
+## `$count` and `$start_index` — pagination
+
+`$count` caps the number of rows returned. `$start_index` skips that many rows. When a page comes back full (`elements.length == $count`), the response includes a `links[].next` entry with the next page's URL.
+
+```
+GET /reporting/orders?$orderby=id&$count=50
+
+{
+  "elements": [...50 rows...],
+  "links": [{"rel": "next", "href": "?$orderby=id&$count=50&$start_index=50"}]
+}
+```
+
+Operators may configure a `MAX_PAGE_SIZE` cap. If you ask for `$count=10000` and the cap is 1000, you'll quietly get 1000 rows — but with a `next` link, so you can walk through. **Always use `$orderby` with pagination.** Without it, the database is free to return rows in any order, including a different order each page.
+
+## `$cursor` — keyset pagination (large walks)
+
+Offset pagination (`$start_index`) is O(n²) total work for full walks: each page makes the database evaluate the underlying query and discard the leading rows. For walks of more than a few thousand rows — agent / ETL / LLM workflows in particular — switch to `$cursor`.
+
+A response with `$orderby` set and a full page includes a `cursor` field alongside `elements`. Pass that token back as `$cursor` on the next request:
+
+```
+GET /reporting/orders?$orderby=id&$count=50
+
+{
+  "elements": [...50 rows...],
+  "cursor": "eyJvcmRlcmJ5IjoiaWQgQVNDIiwidmFsdWVzIjpbNTBdfQ.AbCdEf...",
+  "links": [{"rel": "next", "href": "?$orderby=id&$count=50&$cursor=eyJ..."}]
+}
+
+GET /reporting/orders?$orderby=id&$count=50&$cursor=eyJ...
+
+{
+  "elements": [...next 50 rows...],
+  "cursor": "...",
+  "links": [...]
+}
+```
+
+Walks terminate when the response stops returning a `cursor` field (the last page wasn't full).
+
+**Requirements and constraints:**
+
+- `$cursor` requires `$orderby`. The cursor encodes the orderby clause and the last-row values; resuming under a different `$orderby` is rejected with 400.
+- `$cursor` and `$start_index` are mutually exclusive — using both is a 400.
+- **If you use `$select`, include every `$orderby` column in the projection.** The next-page cursor is minted from the last row's `$orderby` values; if those columns aren't in the projected result, no `cursor` field is emitted and the walk silently terminates.
+- The token is HMAC-signed against the operator-configured `CURSOR_SECRET` env var. Tampering or rotating the secret invalidates a token. When the secret is unset the service generates a per-process random key, which means cursors don't survive process restarts or load-balance across pod replicas — operators running >1 replica should set `CURSOR_SECRET` explicitly.
+- For stable walks, pick an `$orderby` with a unique tiebreaker — `id ASC` works because `id` is unique; `created_at ASC` does not (ties at the page boundary can be skipped or duplicated). Real production walks usually use `created_at ASC, id ASC`.
+- Columns named in `$orderby` should be NOT NULL. NULL values may skip rows or appear in unexpected pages depending on the database's NULL-ordering rules.
+
+## `$groupby` and `$having`
+
+Aggregate-shaped queries work when every selected column is also in the group-by list:
+
+```
+GET /reporting/orders
+  ?$select=status
+  &$filter=created_at gt '2026-01-01'
+  &$groupby=status
+  &$having=status ne 'pending'
+```
+
+Rules:
+
+- `$groupby` requires an explicit `$select` (no `SELECT *`).
+- Every column in `$select` must also appear in `$groupby`.
+- `$having` requires `$groupby`. On its own it returns 400.
+- `$having` uses the same expression grammar as `$filter`.
+
+There are no aggregate functions (`COUNT`, `SUM`, `AVG`) in the grammar. `$groupby` gives you DISTINCT-style "what distinct values exist" queries. If you need `COUNT(*)` per group, that's a custom query.
+
+## Required parameters
+
+Operators can mark certain query parameters as **required** for a particular table by writing a `validation/<schema>/<table>.yaml`:
+
+```yaml
+params:
+  required:
+    - id
+  optional:
+    - category
+    - name
+```
+
+This says "every request to `/<schema>/<table>` must constrain `id` to specific value(s)." It's a guard against unbounded scans — clients can't accidentally `GET /reporting/orders` and pull every row.
+
+**What counts as constraining the column:**
+
+- A simple filter — `?id=5` ✓
+- `$filter=id eq 5` ✓
+- `$filter=id in (1, 2, 3)` ✓
+- AND combinations where one side constrains — `$filter=id eq 5 and category eq 'open'` ✓
+- ORs where **both** sides constrain — `$filter=id eq 1 or id eq 2` ✓
+
+**What does NOT count:**
+
+- Range/exclusion comparisons — `$filter=id gt 0`, `$filter=id ne -1` (these don't bound the result set in a way that satisfies "filter to specific values")
+- Negation — `$filter=not(id eq 5)` (matches everything except one row)
+- ORs where one side doesn't constrain — `$filter=id eq 5 or status eq 'open'` (the OR can match purely on the status branch)
+
+If you hit a 400 with `Required parameter(s) missing: <col>`, the request didn't constrain the column under the rules above. Switch to a simple `?col=value` or use `eq`/`in` in `$filter`.
+
+Custom queries (the `/queries/*` lane below) declare their own required params separately — those follow the simpler rule "the param must be present."
+
+## Route aliases (legacy URL migration)
+
+Both validation YAMLs and custom-query YAMLs can declare URL aliases that route to the same handler as the canonical URL. The motivating use case is migrating off a legacy gateway: register IRIS as the new upstream and have callers keep hitting their existing URLs while you author canonical ones in parallel.
+
+Add an `aliases:` list to the YAML:
+
+```yaml
+# validation/crm/customers.yaml
+params:
+  required: [customer_id]
+aliases:
+  - /legacy/crm/customers        # legacy URL stays alive
+  - /legacy/inventory/sites           # different prefix, same handler
+```
+
+```yaml
+# queries/reports/products_by_category.yaml
+sql: |
+  SELECT * FROM products WHERE category = :category
+params:
+  required: [category]
+aliases:
+  - /legacy/products/by-category
+```
+
+Each alias becomes a FastAPI route. Query parameters pass through unchanged — `GET /legacy/crm/customers?customer_id=42` reaches the handler with the same parameters as `GET /crm/customers?customer_id=42`. Authentication (JWT, passthrough, admin-token) and validation work identically.
+
+**Reserved paths** that cannot be aliased over: `/health`, `/ready`, `/readyz`, `/admin/*`, `/queries/*`, `/openapi.json`, `/docs`, `/redoc`. Aliases that collide with these are rejected at load time with a clear ERROR log.
+
+**Collisions between aliases** (two YAMLs declaring the same alias path) reject the second with a clear ERROR log. The first one wins; the second one is skipped — operators see exactly which YAML is responsible for which URL.
+
+**Shadowing**: if an alias matches `/<schema>/<table>` for a real table in the harvested DDL, the alias takes precedence and the canonical dynamic route at that path becomes unreachable. Logged as a WARNING. Operators may legitimately want this (e.g., redirecting `/old_schema/table` to a different actual table); the warning surfaces it without rejecting.
+
+**OpenAPI presentation**: aliases appear in the canonical operation's description (e.g., the `/crm/customers` operation lists "Also reachable at: `/legacy/crm/customers`"). They are not separate operation entries — keeps the spec lean at scale. Operators wanting per-alias operations in the spec can ask for a future opt-in flag.
+
+**Hot reload**: alias changes via `/admin/reload-config` are not picked up in v1. Aliases register at lifespan startup only; adding or removing aliases requires a process restart. The view-def and custom-query *param contracts* still reload normally — only the route registration is restart-gated.
+
+**Migration playbook**:
+
+1. Author or rehome legacy SQL into `queries/<path>.yaml` files. Add the legacy URL as an alias.
+2. Author or rehome legacy table mappings into `validation/<schema>/<table>.yaml`. Add the legacy URL as an alias.
+3. Deploy IRIS. Confirm both canonical and aliased URLs return identical results.
+4. Re-point the gateway at IRIS as the upstream for the legacy URL prefixes.
+5. Migrate consumers off the aliases over time. Watch traffic via metrics; when the alias sees no traffic, remove it from the YAML.
+
+## Custom queries
+
+Anything the URL grammar can't express — joins, aggregates, `LIKE`, window functions, analytical SQL — is served from YAML files operators drop into a `queries/` directory. They show up as URLs that match their file path:
+
+```
+queries/reports/products_by_category.yaml
+  → GET /queries/reports/products_by_category?category=electronics
+```
+
+To discover what's available:
+
+```
+GET /admin/queries
+Headers: X-Admin-Token: <operator's admin token>
+
+{"queries": ["/queries/reports/category_summary", "/queries/reports/products_by_category"]}
+```
+
+The catalog listing is operator-facing — gated by `X-Admin-Token` rather than the user-facing JWT, and lives on the admin sub-app (`/admin/queries`) so it doesn't appear in the dev `/openapi.json`. End-user clients are typically given the named query URLs they need (in a runbook, internal docs, or a service catalog) rather than enumerating. Invoking an individual named query (`GET /queries/<path>`) follows the normal user-auth rules — no admin token required, JWT if `AUTH__JWKS_URL` is set, otherwise open.
+
+Each custom query declares its required and optional parameters. Missing a required param returns 400. Passing an undeclared param returns 400. Declared parameters are passed as driver-native binds; callers cannot add undeclared parameters.
+
+From a client's perspective, a custom query is just a URL that takes some query parameters and returns the same `{"name": ..., "elements": [...]}` envelope as every other IRIS call.
+
+Custom queries don't paginate the same way — their `elements` is whatever the SQL returns.
+
+## Authentication
+
+### API-level auth (optional)
+
+If the operator has enabled JWT auth, every request needs a Bearer token:
+
+```
+Authorization: Bearer eyJhbGciOi...
+```
+
+Tokens are validated via JWKS. Missing token is 401; invalid signature / expired / wrong audience is 401 or 403. If the operator hasn't configured `AUTH__JWKS_URL`, the API is open at the HTTP edge — IRIS trusts that there's something in front of it (gateway, mesh, network policy).
+
+### Database-identity passthrough (optional, per request)
+
+Some operators wire IRIS so that *your* database credentials are used for the query, rather than IRIS's service account. You send them on a separate header:
+
+```
+X-DB-Authorization: Basic base64(username:password)
+```
+
+`X-DB-Authorization` is intentionally separate from `Authorization` so JWT auth and DB-identity passthrough don't collide. You can send both, one, or neither.
+
+When passthrough is configured and you don't provide credentials, the service account is used — this is the usual mode for server-to-server callers.
+
+Whether passthrough is available depends on the operator. The Trino variant, for example, requires HTTPS for passthrough and may not have it enabled.
+
+### A third lane (you probably won't use it)
+
+`X-Admin-Token` gates everything under `/admin/*` (which now includes the `/admin/queries` catalog listing) — operator surface, not end-user surface. End-user clients should only ever set `Authorization` and/or `X-DB-Authorization`. If you find yourself needing the admin token to do your job, ask the operator whether the endpoint you're hitting is meant for end users or whether you're meant to be calling something else.
+
+## Errors
+
+All errors come back in a unified envelope:
+
+```json
+{"error": {"code": "validation.bad_request", "message": "Invalid column(s): frobnicate"}}
+```
+
+HTTP status code conveys the class:
+
+- `400` — your request was malformed. Invalid column, bad filter syntax, missing required param, `$having` without `$groupby`. The body tells you what.
+- `401` / `403` — auth failure (only applicable when JWT auth is enabled).
+- `404` — schema or table doesn't exist, or custom query path doesn't exist.
+- `503` — IRIS started but can't reach the database right now. Back off and retry.
+
+`error.code` is a stable, machine-readable identifier. Validation/auth codes derive from the HTTP status (`validation.bad_request`, `validation.not_found`, `auth.unauthorized`, `auth.forbidden`); driver codes are `db.bad_credentials` / `db.connection_refused` / `db.permission_denied` / `db.timeout` / `db.query_failed`. The list is open — treat unknown codes within their family as the family's catch-all for fallback.
+
+Operators can run IRIS in three error-detail modes:
+
+- **`terse`** (default): generic messages. Driver-error path collapses to `code: "db.query_failed", message: "Query failed"`; validation messages echo the specific reason since that's caller-input feedback, not server-state leak.
+- **`safe`**: classified `db.<class>` codes with safe messages on driver failures. Validation/auth paths look the same as terse.
+- **`verbose`**: full driver text in `error.message` plus `deployment` and `database` siblings of `error`. Useful for debugging in dev — multi-instance environments can identify which instance produced an error from the body alone (otherwise the `X-{App}-Deployment` response header carries it; `App` derives from `APP_NAME`, e.g. `X-App-Deployment` by default, `X-Iris-Deployment` when `APP_NAME=iris`). If you're debugging a client against an environment in terse mode, grab a dev environment in verbose mode.
+
+Some 404s include a `did_you_mean` field with a fuzzy-matched suggestion (close-typo'd schema, table, or column). Clients may surface it as a hint without depending on it.
+
+## A realistic worked example
+
+Walk through every electronics product priced over 100, paginated:
+
+```
+GET /public/products
+  ?$select=id,name,price,category
+  &$filter=category eq 'electronics' and price gt 100
+  &$orderby=price DESC
+  &$count=25
+```
+
+Response:
+
+```json
+{
+  "name": "products",
+  "elements": [
+    {"id": 1, "name": "Laptop", "price": 999.99, "category": "electronics"}
+  ],
+  "links": [{"rel": "next", "title": "Next interval", "href": "?$select=id,name,price,category&$filter=category+eq+%27electronics%27+and+price+gt+100&$orderby=price+DESC&$count=25&$start_index=25"}]
+}
+```
+
+To walk through the whole result set, follow `links[0].href` until the response has no `links`. (`links` is an array because the response shape leaves room for additional rels — `prev`, `first`, `last` — though only `next` is emitted today.)
+
+The `public.products` schema is what the test-infra Compose stack seeds — paste the URL above against a freshly-spun-up dev environment and it'll return rows.
+
+## Things clients commonly get wrong
+
+- **Forgetting `$orderby` on a paginated call.** Without an explicit order, page boundaries are arbitrary and rows may repeat or vanish.
+- **Using `=` instead of `eq`.** The parser expects `id eq 1`, not `id = 1`. The old SQL-fragment form returns 400 — there is no compatibility mode.
+- **Assuming boolean literals work.** `active eq true` fails. Use the literal the column actually stores.
+- **Mixing `$having` with `$filter` and expecting them to do the same thing.** `$filter` applies before `GROUP BY`, `$having` applies after. Use `$filter` for row-level conditions, `$having` for group-level ones.
+- **Building a URL by hand and forgetting to URL-encode quotes in `$filter`.** Most HTTP clients will handle this for you; raw `curl` won't.
+- **Sending DB credentials on `Authorization` instead of `X-DB-Authorization`.** `Authorization` is for the JWT; DB creds live on their own header so the two lanes don't collide.

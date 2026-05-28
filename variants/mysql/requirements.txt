@@ -1,0 +1,6 @@
+# Driver + runtime-server deltas only. Shared deps come from core
+# (see variants/postgres/requirements.txt for the full list). cryptography
+# is required by aiomysql for sha256 auth. (#45, #198)
+uvicorn[standard]>=0.27
+aiomysql>=0.2
+cryptography>=42

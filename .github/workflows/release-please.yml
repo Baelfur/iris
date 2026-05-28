@@ -1,0 +1,47 @@
+name: release-please
+
+# Maintains a "chore: release vX.Y.Z" PR that accumulates pending
+# changes. Each commit to main updates the open release PR (or opens a
+# new one if none exists) with the next version computed from the
+# Conventional Commits-style commit subjects since the previous tag.
+# Merging the release PR creates the git tag, which then triggers
+# release.yml (the GHCR multi-arch build + GitHub Release).
+#
+# Configuration: see ../../release-please-config.json (skip-changelog
+# is set so release-please doesn't touch CHANGELOG.md — the project
+# keeps a hand-curated narrative; release-please only manages the
+# version bump + tag).
+#
+# Manifest: ../../.release-please-manifest.json tracks the current
+# released version per package. Bump it manually only if you want to
+# force a baseline change; release-please handles routine bumps.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# cancel-in-progress: false — release-please's PR maintenance shouldn't
+# self-cancel when multiple commits land in quick succession.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          # PAT (created in user settings, scope: repo + workflow) stored as
+          # RELEASE_PLEASE_TOKEN secret. Required because tag pushes by
+          # GITHUB_TOKEN do not trigger downstream workflows (anti-loop) —
+          # release.yml depends on the tag push to fire its build job.
+          # Falls back to GITHUB_TOKEN if the secret is missing; release-
+          # please still works for opening release PRs and pushing tags,
+          # but operators have to manually trigger release.yml via
+          # workflow_dispatch in that case.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}

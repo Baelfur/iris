@@ -1,0 +1,4 @@
+# Driver + runtime-server deltas only. Shared deps come from core
+# (see variants/postgres/requirements.txt for the full list). (#45, #198)
+uvicorn[standard]>=0.27
+oracledb>=2.0

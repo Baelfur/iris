@@ -1,0 +1,142 @@
+# {{ display_name }}
+
+A read-only HTTP façade in front of a relational database. You point it at a database, tell it which schemas to expose, and every table in those schemas becomes a paginated, filterable JSON endpoint — without you writing any endpoint code.
+
+OData-flavoured GET endpoints on top of a database, without Hasura, without building a service, without handing out SQL access.
+
+## What it does for you
+
+Drop an `allowlist.yaml` listing the schemas you want exposed, point the connection at your DB, run the container. Every table becomes:
+
+```
+GET /reporting/orders?id=4821
+GET /reporting/orders?$filter=status eq 'open' and total gt 100&$orderby=created_at&$count=50
+GET /reporting/orders?$select=id,total&$groupby=customer_id&$filter=status eq 'shipped'
+```
+
+For things the URL grammar can't express — joins, aggregates across tables, `LIKE`, window functions — operators write the SQL once as a YAML file in `queries/`, and it's served at a matching URL:
+
+```
+queries/reports/products_by_category.yaml
+  → GET /queries/reports/products_by_category?category=electronics
+```
+
+That's the whole product. Five database engines, one API shape, no endpoint code.
+
+## Hello {{ display_name }}
+
+```bash
+# From the repo root
+cp variants/postgres/.env.example variants/postgres/.env
+# fill in host, user, password. The template already sets CONFIG__SOURCE=local
+# (required) and AUTH__MODE=open (dev only — change to gateway or jwt for prod).
+# Without an allowlist.yaml, every non-system schema your DB user can SELECT
+# from becomes part of the dynamic surface; drop an allowlist.yaml at the
+# config root to narrow it.
+
+docker build -t app-postgres:local -f variants/postgres/Dockerfile .
+docker run -d -p 8222:8000 --env-file variants/postgres/.env app-postgres:local
+```
+
+```bash
+curl 'http://localhost:8222/public/products?id=1'
+```
+
+```json
+{
+  "name": "products",
+  "elements": [{ "id": 1, "name": "Laptop", "category": "electronics", "price": 999.99 }]
+}
+```
+
+Swagger UI at `/docs`, ReDoc at `/redoc`, OpenAPI spec at `/openapi.json`.
+
+## Variants
+
+Pick the variant that matches your database. You deploy one.
+
+| Directory | Database | Driver | Official? |
+|---|---|---|---|
+| `variants/oracle/` | Oracle | `oracledb` | ✅ Yes |
+| `variants/postgres/` | PostgreSQL | `psycopg` + `psycopg-pool` | ✅ Yes |
+| `variants/mysql/` | MySQL | `aiomysql` | ❌ Community |
+| `variants/mariadb/` | MariaDB | `aiomysql` | ❌ Community |
+| `variants/trino/` | Trino | `aiotrino` | ❌ Community |
+
+Each variant is a thin adapter on top of the shared `core/` package (routes, query engine, expression parser, logging). See [`docs/reference/variants.md`](docs/reference/variants.md) for per-database quirks and the driver-choice rationale.
+
+## Is this the right tool?
+
+Lean toward {{ display_name }} when consumers are numerous, the requirement is genuinely read-only, and you'd rather have a small bounded API than a flexible one. Lean away when consumers need writes, arbitrary SQL flexibility, federated queries, or sub-10ms p99.
+
+Full decision guide with concrete fit / non-fit cases and posture-level comparisons to alternatives: [`docs/user-guide/when-to-use.md`](docs/user-guide/when-to-use.md).
+
+## Documentation
+
+**For users of {{ display_name }}:**
+
+- **[Using {{ display_name }}](docs/user-guide/using.md)** — integrator's guide. URL grammar, filters, pagination, custom queries, auth, common mistakes.
+- **[Operating {{ display_name }}](docs/user-guide/operating.md)** — SRE guide. Deployment, configuration, probes, observability, sizing, hazards.
+- **[External configuration](docs/user-guide/external-configuration.md)** — picking and operating the right config source (`local` / `git` / `db`), upgrade paths, dev → UAT → prod promotion.
+- **[Security posture](docs/user-guide/security-posture.md)** — for the reviewer signing off. Threat model, controls, residual risks, verification checklist.
+- **[When to use {{ display_name }}](docs/user-guide/when-to-use.md)** — decision guide for architects and engineering managers.
+
+**For maintainers and contributors:**
+
+- **[Architecture](docs/reference/architecture.md)** — how the shared core is structured, the DI context pattern, the expression parser, request lifecycle, how to add a new variant.
+- **[Variants](docs/reference/variants.md)** — per-database technical specifics (paramstyles, pagination dialects, identifier-case handling, driver quirks).
+- **[Versioning](docs/reference/versioning.md)** — semver policy, what counts as the public API, Docker image tag convention, release process.
+
+## Stack
+
+Python 3.12 / FastAPI / Uvicorn, async database drivers (one per variant), Docker / Kubernetes. The shared `core/` package is installable for tests.
+
+## Testing
+
+Cold-checkout shortcut: `make setup && make test` runs the editable install and the shared suite. Below is the same flow spelled out for fine-grained use.
+
+Shared suite (paramstyle-independent — parser, schema cache, view defs, readiness, auth helpers):
+
+```bash
+pip install -e './core[test]'
+cd core/
+pytest tests/                       # paramstyle-independent, no database required
+```
+
+Per-variant (paramstyle-specific SQL emission + integration against a real DB):
+
+```bash
+pip install -r variants/postgres/requirements.txt
+
+cd variants/postgres/
+pytest tests/test_unit.py           # paramstyle-specific, no database required
+pytest tests/test_integration.py    # requires running database with seed data
+```
+
+Seeded test databases for all five variants:
+
+```bash
+cd test-infra/
+docker compose up -d
+```
+
+## Editing docs
+
+Brand-bearing docs (anywhere the project name or display brand appears) live in `docs/**/*.md.tmpl` and `README.md.tmpl` as Jinja2 templates. The rendered `*.md` next to each template is what GitHub serves to readers — both are committed.
+
+Workflow:
+
+```bash
+# 1. Edit the template, NOT the rendered .md.
+vim docs/user-guide/operating.md.tmpl
+
+# 2. Regenerate the rendered file.
+python docs/build.py
+
+# 3. Commit both.
+git add docs/user-guide/operating.md.tmpl docs/user-guide/operating.md
+```
+
+The brand sits in one place: `docs/_config.yml`. Forks renaming the project edit that file and run `python docs/build.py` to rebrand the whole docs tree in one shot. CI's `lint` workflow runs `python docs/build.py --check` and fails the merge if a template change wasn't accompanied by a rebuild.
+
+`CHANGELOG.md` stays as plain `.md` — entries are historical, never templated.

@@ -1,0 +1,108 @@
+stages:
+  - test
+
+# Image-pull source. GitLab doesn't expand `${VAR:-default}` syntax in
+# `image:` fields the way it does in `script:`, so the `:-docker.io`
+# fallback has to live in a top-level variables: block, not inline.
+# Project-level CI_IMAGE_REGISTRY (set in GitLab settings) overrides
+# this default — useful when Docker Hub rate-limits or the runner can
+# only reach an internal mirror / Artifactory.
+variables:
+  CI_IMAGE_REGISTRY: ${CI_IMAGE_REGISTRY:-docker.io}
+
+core-tests:
+  stage: test
+  image: ${CI_IMAGE_REGISTRY}/python:${PYTHON_VERSION}-slim
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.12"]
+  # Postgres sidecar for the DbSource real-DB tests. Default-
+  # local deployments don't need it; CI brings it up so the format-
+  # validation tests run end-to-end.
+  services:
+    - name: ${CI_IMAGE_REGISTRY}/postgres:16
+      alias: postgres
+      variables:
+        POSTGRES_PASSWORD: testpass
+    # Redpanda for Kafka logging integration tests. Kafka-protocol-
+    # compatible, single-binary, no ZooKeeper. The advertised address
+    # must match the service alias (not the image default of localhost),
+    # otherwise clients bootstrap on `redpanda:9092` then follow the
+    # advertised address to `127.0.0.1:9092` and fail.
+    - name: ${CI_IMAGE_REGISTRY}/redpandadata/redpanda:latest
+      alias: redpanda
+      command:
+        - redpanda
+        - start
+        - --mode=dev-container
+        - --smp=1
+        - --memory=512M
+        - --reserve-memory=0M
+        - --overprovisioned
+        - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+        - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+  cache:
+    key:
+      files:
+        - core/pyproject.toml
+    paths:
+      - .pip-cache/
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+    TEST_CONFIG_DSN: "host=postgres port=5432 user=postgres password=testpass dbname=postgres"
+    TEST_KAFKA_BROKERS: "redpanda:9092"
+  script:
+    - pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+    - cd core && python -m pytest tests/ -v
+  rules:
+    # Skip docs-only / k8s-only / Dockerfile-only changes — nothing here
+    # exercises code or deps. Mirrors the GH Actions paths filter.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - "**/*.py"
+        - "**/requirements.txt"
+        - "core/pyproject.toml"
+        - ".gitlab-ci.yml"
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - "**/*.py"
+        - "**/requirements.txt"
+        - "core/pyproject.toml"
+        - ".gitlab-ci.yml"
+
+variant-unit-tests:
+  stage: test
+  image: ${CI_IMAGE_REGISTRY}/python:${PYTHON_VERSION}-slim
+  parallel:
+    matrix:
+      - VARIANT: [oracle, postgres, mysql, mariadb, trino]
+        PYTHON_VERSION: ["3.12"]
+  cache:
+    key:
+      files:
+        - core/pyproject.toml
+        - variants/${VARIANT}/requirements.txt
+    paths:
+      - .pip-cache/
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  script:
+    # [test] extra carries pytest/pytest-asyncio/httpx made
+    # variant requirements.txt driver-only.
+    - pip install -e './core[test]'
+    - pip install -r variants/${VARIANT}/requirements.txt
+    - cd variants/${VARIANT} && python -m pytest tests/test_unit.py -v
+  rules:
+    # Same paths filter as core-tests above.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - "**/*.py"
+        - "**/requirements.txt"
+        - "core/pyproject.toml"
+        - ".gitlab-ci.yml"
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - "**/*.py"
+        - "**/requirements.txt"
+        - "core/pyproject.toml"
+        - ".gitlab-ci.yml"

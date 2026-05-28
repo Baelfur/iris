@@ -1,0 +1,145 @@
+name: Unit Tests
+
+# Runs on push/PR for both `main` and `dev`. Feature/fix PRs target dev
+# under the dev-branch flow (see docs/reference/versioning.md), and the
+# dev → main promotion PR re-runs the same suite as a final gate. Skip
+# docs-only / k8s-only / Dockerfile-only changes — nothing they touch
+# exercises code or deps.
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - '**/*.py'
+      - '**/requirements.txt'
+      - 'core/pyproject.toml'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - '**/*.py'
+      - '**/requirements.txt'
+      - 'core/pyproject.toml'
+      - '.github/workflows/**'
+
+# Dedup superseded runs on the same branch — when commits land in
+# quick succession, only the latest one's CI runs to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+    # Postgres service for the DbSource real-DB tests. CI tests
+    # against this; default-local deployments still don't need it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      # Redpanda for the Kafka logging integration tests. Kafka-
+      # protocol-compatible, single-binary, no ZooKeeper. Dev mode +
+      # auto-create-topics so tests publish to per-test unique topic
+      # names without pre-creation.
+      redpanda:
+        image: redpandadata/redpanda:latest
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "rpk cluster health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_CONFIG_DSN: "host=localhost port=5432 user=postgres password=testpass dbname=postgres"
+      TEST_KAFKA_BROKERS: "localhost:9092"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: core/pyproject.toml
+      - name: Install core with test + observability + config + kafka extras
+        # All optional extras pulled so format-validation tests (issue
+        # references) run end-to-end rather than skipping. Default-off
+        # deployments don't need any of these at runtime.
+        run: pip install -e './core[test,metrics,tracing,config-git,config-db,kafka]'
+      - name: Run core tests with coverage
+        # --cov drives pytest-cov; --cov-report=term shows the per-file
+        # coverage summary in the CI log, --cov-report=xml emits a
+        # machine-readable report for any future Codecov / Coveralls
+        # integration. fail_under threshold is configured in
+        # core/pyproject.toml [tool.coverage.report].
+        run: cd core && python -m pytest tests/ -v --cov --cov-report=term --cov-report=xml
+      - name: pip-audit (CVE scan against installed dependencies)
+        # Strict mode fails on any unfixed vulnerability. Audits the
+        # output of `pip freeze` (filtered to non-editable packages)
+        # rather than the live environment, because pip-audit's
+        # --strict treats any skip — including --skip-editable's skip
+        # of our own core install — as an error. Filtering at the
+        # input layer avoids the strict-vs-skip-editable conflict.
+        # Dependabot handles ongoing version drift; pip-audit
+        # catches CVEs that haven't produced a fix-version PR yet.
+        #
+        # Pip itself is upgraded first because the runner's bundled
+        # pip can lag enough to have known CVEs; upgrading to latest
+        # mitigates them before the audit runs.
+        run: |
+          pip install --upgrade pip pip-audit
+          # Anchor to `core==` (with the version separator) so other
+          # packages that happen to start with "core" aren't accidentally
+          # filtered. The own-install line in pip freeze looks like
+          # `core==X.Y.Z` since the distribution name was renamed
+          # iris-core -> core.
+          pip freeze | grep -v '^-e ' | grep -v '^core==' > /tmp/audit-reqs.txt
+          # PYSEC-2026-161 (CVE-2026-48710 "BadHost"): missing Host
+          # header validation in starlette < 1.0.1 can let an attacker
+          # poison request.url.path and bypass path-based auth checks.
+          # Upstream blocker: prometheus-fastapi-instrumentator (latest
+          # 7.1.0) pins starlette<1.0.0, so the [metrics] extra prevents
+          # bumping. The service's auth reads explicit headers
+          # (Authorization / X-DB-Authorization / X-Admin-Token) and
+          # never reconstructs URLs from the Host header, so the
+          # exploit path doesn't reach our threat surface. Drop this
+          # ignore when prometheus-fastapi-instrumentator releases a
+          # starlette-1.0-compatible version (tracked).
+          pip-audit --strict -r /tmp/audit-reqs.txt \
+            --ignore-vuln PYSEC-2026-161
+
+  variant:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [oracle, postgres, mysql, mariadb, trino]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            core/pyproject.toml
+            variants/${{ matrix.variant }}/requirements.txt
+      - name: Install dependencies
+        # core's [test] extra brings pytest/pytest-asyncio/httpx that
+        # variant unit tests need; variant requirements.txt is driver-only
+        #, so [test] must be on the core install.
+        run: |
+          pip install -e './core[test]'
+          pip install -r variants/${{ matrix.variant }}/requirements.txt
+      - name: Run variant unit tests (paramstyle-specific)
+        run: cd variants/${{ matrix.variant }} && python -m pytest tests/test_unit.py -v
