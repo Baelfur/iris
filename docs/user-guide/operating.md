@@ -4,7 +4,7 @@ You're deploying and running IRIS. This is what you need to know to do that well
 
 ## What IRIS actually is, operationally
 
-A stateless FastAPI app, served by uvicorn, packaged as a Docker image. One image per supported database family — `app-postgres`, `app-mysql`, `app-mariadb`, `app-oracle`, `app-trino`. Python 3.12. Listens on port 8000 inside the container.
+A stateless FastAPI app, served by uvicorn, packaged as a Docker image. One image per supported database family — `iris-public-postgres`, `iris-public-mysql`, `iris-public-mariadb`, `iris-public-oracle`, `iris-public-trino`. Python 3.12. Listens on port 8000 inside the container.
 
 It holds exactly two kinds of state:
 
@@ -33,7 +33,7 @@ Every variant has the same deployable surface:
 Build and push:
 
 ```bash
-docker build -t <registry>/app-postgres:1.0.0 -f variants/postgres/Dockerfile .
+docker build -t <registry>/iris-public-postgres:1.0.0 -f variants/postgres/Dockerfile .
 ```
 
 Note the `-f` and the build context — Dockerfile is per-variant but the context is the repo root, because it also needs to copy the shared `core/` package.
@@ -48,13 +48,13 @@ The deployment runs 2 replicas by default, with an HPA that scales up to 10 on 7
 
 ### Naming convention
 
-Pick a stable `DEPLOYMENT_NAME` per IRIS instance and let it cascade. Two `app-postgres` deployments fronting different DBs should have different names — `inventory`, `billing`, `audit`, etc. The name is optional, but every layer that consumes it gets noticeably cleaner identity when set.
+Pick a stable `DEPLOYMENT_NAME` per IRIS instance and let it cascade. Two `iris-public-postgres` deployments fronting different DBs should have different names — `inventory`, `billing`, `audit`, etc. The name is optional, but every layer that consumes it gets noticeably cleaner identity when set.
 
 Recommended pattern:
 
 | Surface | Convention |
 |---|---|
-| Pod / k8s service | `iris-<variant>-<deployment-name>` (e.g. `app-postgres-inventory`) |
+| Pod / k8s service | `iris-public-<variant>-<deployment-name>` (e.g. `iris-public-postgres-inventory`) |
 | `DEPLOYMENT_NAME` env var | `<deployment-name>` (e.g. `inventory`) |
 | Structured-log field | `"deployment": "<deployment-name>"` (auto-emitted) |
 | OTel `service.name` | `iris-<deployment-name>` (default when `OTEL_SERVICE_NAME` is unset) |
@@ -62,7 +62,7 @@ Recommended pattern:
 
 Validation: the env var must match `^[a-z][a-z0-9_-]{0,62}$` (lowercase, alphanumeric + underscore + hyphen, ≤63 chars, starts with a letter). A bad value fails fast at lifespan startup with a clear error. Hyphens are accepted because Kubernetes / Helm / Docker names use them pervasively; when `CONFIG__SOURCE=db`, `DbSource` normalizes hyphens to underscores for the per-deployment Postgres database name (unquoted identifier rules), logging the substitution at INFO.
 
-Pod and service names aren't constrained by the regex (k8s allows hyphens), but making them visually consistent — `app-postgres-inventory` for the pod, `inventory` for the env var — is the easy operational story.
+Pod and service names aren't constrained by the regex (k8s allows hyphens), but making them visually consistent — `iris-public-postgres-inventory` for the pod, `inventory` for the env var — is the easy operational story.
 
 ## Configuration
 
@@ -212,7 +212,7 @@ spec:
             - name: config
               mountPath: /config
         - name: iris
-          image: ghcr.io/baelfur/app-postgres:latest
+          image: ghcr.io/baelfur/iris-public-postgres:latest
           env:
             - name: AUTH__MODE
               value: "jwt"
@@ -358,7 +358,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: app-postgres
+      app: iris-public-postgres
   policyTypes: [Ingress]
   ingress:
     - from:
@@ -452,7 +452,7 @@ IRIS emits structured JSON logs to stdout, one event per line. Every record carr
 ```json
 {"timestamp": "2026-04-22T12:34:56.789Z", "level": "INFO", "logger": "iris",
  "message": "GET /reporting/orders 200 12.4ms", "module": "main",
- "database": "postgresql", "host": "app-postgres-7d8b9-abcde",
+ "database": "postgresql", "host": "iris-public-postgres-7d8b9-abcde",
  "deployment": "inventory"}
 ```
 
@@ -720,23 +720,23 @@ Native TLS limitations: cert rotation is operator-driven (mount the new files, s
 
     ```bash
     # Default — python:3.12-slim runtime. Anyone can pull.
-    docker pull ghcr.io/baelfur/app-postgres:X.Y.Z
+    docker pull ghcr.io/baelfur/iris-public-postgres:X.Y.Z
 
     # Free hardened — gcr.io/distroless/python3-debian12 runtime. Anyone can pull.
     # No shell at runtime; entrypoint is Python so it works.
-    docker pull ghcr.io/baelfur/app-postgres:X.Y.Z-distroless
+    docker pull ghcr.io/baelfur/iris-public-postgres:X.Y.Z-distroless
 
     # Vendor-curated hardened — Docker Hardened Images runtime.
     # Requires a Docker Hub subscription with DHI entitlement to pull.
     docker login
-    docker pull ghcr.io/baelfur/app-postgres:X.Y.Z-dhi
+    docker pull ghcr.io/baelfur/iris-public-postgres:X.Y.Z-dhi
     ```
 
     See [Versioning — Docker image tag convention](../reference/versioning.md#docker-image-tag-convention) for the full tag matrix. Want a base IRIS doesn't pre-publish (Chainguard, Iron Bank, private hardened registry)? Build it yourself by overriding the `BASE_IMAGE` build-arg:
 
     ```bash
     docker build --build-arg BASE_IMAGE=<your-org-approved-image> \
-      -f variants/postgres/Dockerfile -t app-postgres:hardened .
+      -f variants/postgres/Dockerfile -t iris-public-postgres:hardened .
     ```
 
     Run as non-root in production regardless of base image.

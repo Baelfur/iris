@@ -251,7 +251,7 @@ Shared route code only ever catches `DatabaseError`. This means:
   "module": "main",
   "message": "GET /public/products 200 93.73ms",
   "database": "postgresql",
-  "host": "app-postgres-7d8b9-abcde",
+  "host": "iris-public-postgres-7d8b9-abcde",
   "deployment": "inventory"
 }
 ```
@@ -326,7 +326,7 @@ The "tag is the last step" rule: build validation must pass on the PR before the
 
 Triggers on tag pushes matching `v*` (and on pushes to `main` for the `:main` rolling tag, and `workflow_dispatch` for backfills). On a tag push:
 
-1. **Build matrix** fans out across the 5 variants × 2 architectures (`linux/amd64`, `linux/arm64`) using QEMU + Buildx. GHA-cached pip layers keep multi-arch tractable. Pushes to `ghcr.io/baelfur/{{ app_name }}-{variant}:{X.Y.Z}` and, for stable releases (no `-` in the version), `:latest`.
+1. **Build matrix** fans out across the 5 variants × 2 architectures (`linux/amd64`, `linux/arm64`) using QEMU + Buildx. GHA-cached pip layers keep multi-arch tractable. Pushes to `ghcr.io/baelfur/iris-public-{variant}:{X.Y.Z}` and, for stable releases (no `-` in the version), `:latest`.
 2. **Release job** (gated on `needs: build`) checks out `main` (with PAT so it can push later), extracts the `## [Unreleased]` section from `CHANGELOG.md` via awk as the Release body (falls back to `## [X.Y.Z]` for backfills / re-runs / manual rename cases, then a placeholder if neither has content), and upserts the GitHub Release: if `gh release view` succeeds (release-please created it on tag push), `gh release edit --notes-file` overwrites the auto-generated commit-list body with the curated CHANGELOG section. If not (e.g., manual tag push without release-please), `gh release create` makes one from scratch.
 3. **CHANGELOG close-out** (final step, gated on Release publication succeeding) renames `## [Unreleased]` → `## [X.Y.Z] - YYYY-MM-DD` in `CHANGELOG.md`, prepends a fresh empty `## [Unreleased]` for the next cycle, and pushes the bot commit `chore: close [Unreleased] -> [X.Y.Z] in CHANGELOG` to `main`. Skipped when the `[X.Y.Z]` section already exists (operator pre-renamed, or this is a re-run).
 

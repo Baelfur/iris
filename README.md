@@ -34,8 +34,8 @@ cp variants/postgres/.env.example variants/postgres/.env
 # from becomes part of the dynamic surface; drop an allowlist.yaml at the
 # config root to narrow it.
 
-docker build -t app-postgres:local -f variants/postgres/Dockerfile .
-docker run -d -p 8222:8000 --env-file variants/postgres/.env app-postgres:local
+docker build -t iris-public-postgres:local -f variants/postgres/Dockerfile .
+docker run -d -p 8222:8000 --env-file variants/postgres/.env iris-public-postgres:local
 ```
 
 ```bash

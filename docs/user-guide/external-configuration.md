@@ -8,7 +8,7 @@ Most IRIS deployments fall into one of two patterns. Picking the right one upfro
 
 ### Shape A — consume the upstream image, manage config externally
 
-Your team pulls `ghcr.io/baelfur/iris-{variant}:X.Y.Z` directly. You don't fork the IRIS repo. Your config lives in a place you own — a config repo, a config Postgres — and IRIS reads from there at startup.
+Your team pulls `ghcr.io/baelfur/iris-public-{variant}:X.Y.Z` directly. You don't fork the IRIS repo. Your config lives in a place you own — a config repo, a config Postgres — and IRIS reads from there at startup.
 
 What you own:
 - k8s manifests (probably as Helm or Kustomize)
@@ -60,7 +60,7 @@ docker run -d \
   -e PG_HOST=... -e PG_USER=... -e PG_PASSWORD=... -e PG_DATABASE=... \
   -e CONFIG__SOURCE=local \
   -e CONFIG__LOCAL_ROOT=/opt/myapp/config \
-  ghcr.io/baelfur/app-postgres:X.Y.Z
+  ghcr.io/baelfur/iris-public-postgres:X.Y.Z
 ```
 
 ```bash
@@ -70,7 +70,7 @@ docker run -d \
   -e CONFIG__SOURCE=local \
   -v /host/path/to/iris-config:/app/iris-config:ro \
   -e CONFIG__LOCAL_ROOT=/app/iris-config \
-  ghcr.io/baelfur/app-postgres:X.Y.Z
+  ghcr.io/baelfur/iris-public-postgres:X.Y.Z
 ```
 
 Add a YAML → re-mount or rebuild → call `POST /admin/reload-config` (or restart). That's the loop.
@@ -235,10 +235,10 @@ One config Postgres server, two IRIS instances, fully isolated:
 
 ```
 config-pg:5432
-├── database: inventory       ← app-postgres-inventory reads from here
+├── database: inventory       ← iris-public-postgres-inventory reads from here
 │   ├── iris_config_validations
 │   └── iris_config_queries
-└── database: billing         ← app-postgres-billing reads from here
+└── database: billing         ← iris-public-postgres-billing reads from here
     ├── iris_config_validations
     └── iris_config_queries
 ```
@@ -295,9 +295,9 @@ The promotion mechanics are standard image-tag flow, with one wrinkle if you're 
 Each environment has its own k8s manifest with its own image tag:
 
 ```
-dev/deployment.yaml      → image: app-postgres:1.1.0-rc.1
-uat/deployment.yaml      → image: app-postgres:1.1.0
-prod/deployment.yaml     → image: app-postgres:1.1.0
+dev/deployment.yaml      → image: iris-public-postgres:1.1.0-rc.1
+uat/deployment.yaml      → image: iris-public-postgres:1.1.0
+prod/deployment.yaml     → image: iris-public-postgres:1.1.0
 ```
 
 For `git` source, the config repo can be branched per environment too:

@@ -60,7 +60,7 @@ If you import from `core` in your own code, you're on the internal side — expe
 
 ## Docker image tag convention
 
-Images are published to GHCR at `ghcr.io/baelfur/{{ app_name }}-{variant}:{tag}`.
+Images are published to GHCR at `ghcr.io/baelfur/iris-public-{variant}:{tag}`.
 
 The tag is `<version-or-rolling><base-suffix>` where the base suffix is empty for the default `python:3.12-slim` runtime, `-distroless` for `gcr.io/distroless/python3-debian12`, and `-dhi` for the Docker Hardened Image (`dhi/python:3.12`). The DHI tags only publish when the repo has Docker Hub auth configured (operator-side decision; see `release.yml`).
 
@@ -115,7 +115,7 @@ Three fixes plus two features in one promotion produces one minor bump, not five
 Two automation layers:
 
 1. **`.github/workflows/release-please.yml`** maintains a "chore: release vX.Y.Z" PR that accumulates pending changes. Each commit to `main` updates the open release PR (or opens a new one) with the next version computed from Conventional Commits-style commit subjects (`feat:` → minor bump, `fix:` → patch, `BREAKING CHANGE:` in body → major). The release PR contains the version bump in `core/pyproject.toml` + `.release-please-manifest.json`. **Release-please does not touch `CHANGELOG.md`** — see "CHANGELOG handling" below.
-2. **`.github/workflows/release.yml`** triggers when a `vX.Y.Z` tag is pushed. Matrix-builds all 5 variants for `linux/amd64` + `linux/arm64`, publishes `ghcr.io/baelfur/{{ app_name }}-{variant}:X.Y.Z` (and updates `:latest` for stable versions), then creates a GitHub Release whose body is the matching `CHANGELOG.md` section.
+2. **`.github/workflows/release.yml`** triggers when a `vX.Y.Z` tag is pushed. Matrix-builds all 5 variants for `linux/amd64` + `linux/arm64`, publishes `ghcr.io/baelfur/iris-public-{variant}:X.Y.Z` (and updates `:latest` for stable versions), then creates a GitHub Release whose body is the matching `CHANGELOG.md` section.
 
 ### Maintainer flow
 
@@ -141,4 +141,4 @@ Pre-release tags (`vX.Y.Z-rc.1`, `vX.Y.Z-beta.2`) follow the same flow but are f
 
 ## Reverting
 
-Each release is a git tag on `main`. To roll back a running deployment, pin your Docker image to the previous version tag (e.g. `ghcr.io/baelfur/app-postgres:X.Y.Z-1` instead of `:X.Y.Z`) and redeploy. {{ display_name }} is a stateless read layer — no migrations to unwind.
+Each release is a git tag on `main`. To roll back a running deployment, pin your Docker image to the previous version tag (e.g. `ghcr.io/baelfur/iris-public-postgres:X.Y.Z-1` instead of `:X.Y.Z`) and redeploy. {{ display_name }} is a stateless read layer — no migrations to unwind.
